@@ -6,14 +6,18 @@ approvers:
   - dims
   - justaugustus
 reviewers:
+  - aojea
   - sttts
   - cpanato
   - dims
   - nikhita
   - jeremyrickard
   - justaugustus
+  - palnabarun
   - puerco
   - saschagrunert
+  - Verolop
+  - xmudrii
 labels:
   - sig/release
   - area/release-eng

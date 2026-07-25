@@ -32,11 +32,12 @@ import (
 )
 
 type REST struct {
-	authorizer authorizer.Authorizer
+	authorizer authorizer.UnconditionalAuthorizer
+	scheme     *runtime.Scheme
 }
 
-func NewREST(authorizer authorizer.Authorizer) *REST {
-	return &REST{authorizer}
+func NewREST(authorizer authorizer.UnconditionalAuthorizer, scheme *runtime.Scheme) *REST {
+	return &REST{authorizer, scheme}
 }
 
 func (r *REST) NamespaceScoped() bool {
@@ -47,12 +48,25 @@ func (r *REST) New() runtime.Object {
 	return &authorizationapi.LocalSubjectAccessReview{}
 }
 
+// Destroy cleans up resources on shutdown.
+func (r *REST) Destroy() {
+	// Given no underlying store, we don't destroy anything
+	// here explicitly.
+}
+
+var _ rest.SingularNameProvider = &REST{}
+
+func (r *REST) GetSingularName() string {
+	return "localsubjectaccessreview"
+}
+
 func (r *REST) Create(ctx context.Context, obj runtime.Object, createValidation rest.ValidateObjectFunc, options *metav1.CreateOptions) (runtime.Object, error) {
 	localSubjectAccessReview, ok := obj.(*authorizationapi.LocalSubjectAccessReview)
 	if !ok {
 		return nil, apierrors.NewBadRequest(fmt.Sprintf("not a LocaLocalSubjectAccessReview: %#v", obj))
 	}
-	if errs := authorizationvalidation.ValidateLocalSubjectAccessReview(localSubjectAccessReview); len(errs) > 0 {
+
+	if errs := authorizationvalidation.ValidateLocalSubjectAccessReviewCreate(ctx, r.scheme, localSubjectAccessReview); len(errs) > 0 {
 		return nil, apierrors.NewInvalid(authorizationapi.Kind(localSubjectAccessReview.Kind), "", errs)
 	}
 	namespace := genericapirequest.NamespaceValue(ctx)
@@ -77,9 +91,7 @@ func (r *REST) Create(ctx context.Context, obj runtime.Object, createValidation 
 		Denied:  (decision == authorizer.DecisionDeny),
 		Reason:  reason,
 	}
-	if evaluationErr != nil {
-		localSubjectAccessReview.Status.EvaluationError = evaluationErr.Error()
-	}
+	localSubjectAccessReview.Status.EvaluationError = authorizationutil.BuildEvaluationError(evaluationErr, authorizationAttributes)
 
 	return localSubjectAccessReview, nil
 }

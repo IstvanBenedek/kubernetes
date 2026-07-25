@@ -1,6 +1,11 @@
+> ⚠️ **This is an automatically published [staged repository](https://git.k8s.io/kubernetes/staging#external-repository-staging-area) for Kubernetes**.   
+> Contributions, including issues and pull requests, should be made to the main Kubernetes repository: [https://github.com/kubernetes/kubernetes](https://github.com/kubernetes/kubernetes).  
+> This repository is read-only for importing, and not used for direct contributions.  
+> See [CONTRIBUTING.md](./CONTRIBUTING.md) for more details.
+
 # kube-scheduler
 
-Implements [KEP 14 - Moving ComponentConfig API types to staging repos](https://git.k8s.io/enhancements/keps/sig-cluster-lifecycle/wgs/0014-20180707-componentconfig-api-types-to-staging.md#kube-scheduler-changes)
+Implements [KEP 115 - Moving ComponentConfig API types to staging repos](https://git.k8s.io/enhancements/keps/sig-cluster-lifecycle/wgs/115-componentconfig#kube-scheduler-changes)
 
 This repo provides external, versioned ComponentConfig API types for configuring the kube-scheduler.
 These external types can easily be vendored and used by any third-party tool writing Kubernetes

@@ -38,13 +38,14 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/uuid"
+	"k8s.io/klog/v2/ktesting"
 	admissionapi "k8s.io/pod-security-admission/admission/api"
 	"k8s.io/pod-security-admission/admission/api/load"
 	"k8s.io/pod-security-admission/api"
 	"k8s.io/pod-security-admission/metrics"
 	"k8s.io/pod-security-admission/policy"
 	"k8s.io/pod-security-admission/test"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 )
 
 func TestDefaultExtractPodSpec(t *testing.T) {
@@ -267,9 +268,19 @@ func TestValidateNamespace(t *testing.T) {
 		},
 		{
 			name:           "create restricted",
-			newLabels:      map[string]string{api.EnforceLevelLabel: string(api.LevelBaseline)},
+			newLabels:      map[string]string{api.EnforceLevelLabel: string(api.LevelRestricted)},
 			expectAllowed:  true,
 			expectListPods: false,
+		},
+		{
+			name:             "create restricted exempt",
+			newLabels:        map[string]string{api.EnforceLevelLabel: string(api.LevelRestricted)},
+			exemptNamespaces: []string{"test"},
+			expectAllowed:    true,
+			expectListPods:   false,
+			expectWarnings: []string{
+				`namespace "test" is exempt from Pod Security, and the policy (enforce=restricted:latest) will be ignored`,
+			},
 		},
 		{
 			name:           "create malformed level",
@@ -346,10 +357,18 @@ func TestValidateNamespace(t *testing.T) {
 		{
 			name:             "update exempt to restricted",
 			exemptNamespaces: []string{"test"},
-			newLabels:        map[string]string{api.EnforceLevelLabel: string(api.LevelRestricted), api.EnforceVersionLabel: "v1.0"},
-			oldLabels:        map[string]string{},
-			expectAllowed:    true,
-			expectListPods:   false,
+			newLabels: map[string]string{
+				api.EnforceLevelLabel:   string(api.LevelRestricted),
+				api.EnforceVersionLabel: "v1.0",
+				api.AuditLevelLabel:     string(api.LevelRestricted),
+				api.WarnLevelLabel:      string(api.LevelBaseline),
+			},
+			oldLabels:      map[string]string{},
+			expectAllowed:  true,
+			expectListPods: false,
+			expectWarnings: []string{
+				`namespace "test" is exempt from Pod Security, and the policy (enforce=restricted:v1.0, audit=restricted:latest, warn=baseline:latest) will be ignored`,
+			},
 		},
 
 		// update tests that introduce labels errors
@@ -451,19 +470,19 @@ func TestValidateNamespace(t *testing.T) {
 			oldLabels:            map[string]string{api.EnforceLevelLabel: string(api.LevelBaseline)},
 			pods: []*corev1.Pod{
 				// ensure exempt pods don't use up the limit of evaluated pods
-				{ObjectMeta: metav1.ObjectMeta{Name: "exemptpod1", Annotations: map[string]string{"error": "message1"}}, Spec: corev1.PodSpec{RuntimeClassName: pointer.String("runtimeclass1")}},
-				{ObjectMeta: metav1.ObjectMeta{Name: "exemptpod2", Annotations: map[string]string{"error": "message1"}}, Spec: corev1.PodSpec{RuntimeClassName: pointer.String("runtimeclass1")}},
-				{ObjectMeta: metav1.ObjectMeta{Name: "exemptpod3", Annotations: map[string]string{"error": "message1"}}, Spec: corev1.PodSpec{RuntimeClassName: pointer.String("runtimeclass1")}},
-				{ObjectMeta: metav1.ObjectMeta{Name: "exemptpod4", Annotations: map[string]string{"error": "message1"}}, Spec: corev1.PodSpec{RuntimeClassName: pointer.String("runtimeclass1")}},
+				{ObjectMeta: metav1.ObjectMeta{Name: "exemptpod1", Annotations: map[string]string{"error": "message1"}}, Spec: corev1.PodSpec{RuntimeClassName: ptr.To("runtimeclass1")}},
+				{ObjectMeta: metav1.ObjectMeta{Name: "exemptpod2", Annotations: map[string]string{"error": "message1"}}, Spec: corev1.PodSpec{RuntimeClassName: ptr.To("runtimeclass1")}},
+				{ObjectMeta: metav1.ObjectMeta{Name: "exemptpod3", Annotations: map[string]string{"error": "message1"}}, Spec: corev1.PodSpec{RuntimeClassName: ptr.To("runtimeclass1")}},
+				{ObjectMeta: metav1.ObjectMeta{Name: "exemptpod4", Annotations: map[string]string{"error": "message1"}}, Spec: corev1.PodSpec{RuntimeClassName: ptr.To("runtimeclass1")}},
 				// ensure replicas from the same controller don't use up limit of evaluated pods
-				{ObjectMeta: metav1.ObjectMeta{Name: "replicaset1pod1", Annotations: map[string]string{"error": "replicaset1error"}, OwnerReferences: []metav1.OwnerReference{{UID: types.UID("1"), Controller: pointer.Bool(true)}}}},
-				{ObjectMeta: metav1.ObjectMeta{Name: "replicaset1pod2", Annotations: map[string]string{"error": "replicaset1error"}, OwnerReferences: []metav1.OwnerReference{{UID: types.UID("1"), Controller: pointer.Bool(true)}}}},
-				{ObjectMeta: metav1.ObjectMeta{Name: "replicaset1pod3", Annotations: map[string]string{"error": "replicaset1error"}, OwnerReferences: []metav1.OwnerReference{{UID: types.UID("1"), Controller: pointer.Bool(true)}}}},
-				{ObjectMeta: metav1.ObjectMeta{Name: "replicaset1pod4", Annotations: map[string]string{"error": "replicaset1error"}, OwnerReferences: []metav1.OwnerReference{{UID: types.UID("1"), Controller: pointer.Bool(true)}}}},
-				{ObjectMeta: metav1.ObjectMeta{Name: "replicaset2pod1", Annotations: map[string]string{"error": "replicaset2error"}, OwnerReferences: []metav1.OwnerReference{{UID: types.UID("2"), Controller: pointer.Bool(true)}}}},
-				{ObjectMeta: metav1.ObjectMeta{Name: "replicaset2pod2", Annotations: map[string]string{"error": "replicaset2error"}, OwnerReferences: []metav1.OwnerReference{{UID: types.UID("2"), Controller: pointer.Bool(true)}}}},
-				{ObjectMeta: metav1.ObjectMeta{Name: "replicaset2pod3", Annotations: map[string]string{"error": "replicaset2error"}, OwnerReferences: []metav1.OwnerReference{{UID: types.UID("2"), Controller: pointer.Bool(true)}}}},
-				{ObjectMeta: metav1.ObjectMeta{Name: "replicaset2pod4", Annotations: map[string]string{"error": "replicaset2error"}, OwnerReferences: []metav1.OwnerReference{{UID: types.UID("2"), Controller: pointer.Bool(true)}}}},
+				{ObjectMeta: metav1.ObjectMeta{Name: "replicaset1pod1", Annotations: map[string]string{"error": "replicaset1error"}, OwnerReferences: []metav1.OwnerReference{{UID: types.UID("1"), Controller: ptr.To(true)}}}},
+				{ObjectMeta: metav1.ObjectMeta{Name: "replicaset1pod2", Annotations: map[string]string{"error": "replicaset1error"}, OwnerReferences: []metav1.OwnerReference{{UID: types.UID("1"), Controller: ptr.To(true)}}}},
+				{ObjectMeta: metav1.ObjectMeta{Name: "replicaset1pod3", Annotations: map[string]string{"error": "replicaset1error"}, OwnerReferences: []metav1.OwnerReference{{UID: types.UID("1"), Controller: ptr.To(true)}}}},
+				{ObjectMeta: metav1.ObjectMeta{Name: "replicaset1pod4", Annotations: map[string]string{"error": "replicaset1error"}, OwnerReferences: []metav1.OwnerReference{{UID: types.UID("1"), Controller: ptr.To(true)}}}},
+				{ObjectMeta: metav1.ObjectMeta{Name: "replicaset2pod1", Annotations: map[string]string{"error": "replicaset2error"}, OwnerReferences: []metav1.OwnerReference{{UID: types.UID("2"), Controller: ptr.To(true)}}}},
+				{ObjectMeta: metav1.ObjectMeta{Name: "replicaset2pod2", Annotations: map[string]string{"error": "replicaset2error"}, OwnerReferences: []metav1.OwnerReference{{UID: types.UID("2"), Controller: ptr.To(true)}}}},
+				{ObjectMeta: metav1.ObjectMeta{Name: "replicaset2pod3", Annotations: map[string]string{"error": "replicaset2error"}, OwnerReferences: []metav1.OwnerReference{{UID: types.UID("2"), Controller: ptr.To(true)}}}},
+				{ObjectMeta: metav1.ObjectMeta{Name: "replicaset2pod4", Annotations: map[string]string{"error": "replicaset2error"}, OwnerReferences: []metav1.OwnerReference{{UID: types.UID("2"), Controller: ptr.To(true)}}}},
 				// ensure unique pods are prioritized before additional replicas
 				{ObjectMeta: metav1.ObjectMeta{Name: "uniquepod1", Annotations: map[string]string{"error": "uniquemessage1"}}},
 				{ObjectMeta: metav1.ObjectMeta{Name: "uniquepod2", Annotations: map[string]string{"error": "uniquemessage2"}}},
@@ -486,6 +505,7 @@ func TestValidateNamespace(t *testing.T) {
 
 	for _, tc := range testcases {
 		t.Run(tc.name, func(t *testing.T) {
+			_, ctx := ktesting.NewTestContext(t)
 			newObject := &corev1.Namespace{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:   "test",
@@ -520,6 +540,14 @@ func TestValidateNamespace(t *testing.T) {
 					Level:   api.LevelPrivileged,
 					Version: api.LatestVersion(),
 				},
+				Audit: api.LevelVersion{
+					Level:   api.LevelPrivileged,
+					Version: api.LatestVersion(),
+				},
+				Warn: api.LevelVersion{
+					Level:   api.LevelPrivileged,
+					Version: api.LatestVersion(),
+				},
 			}
 			if tc.defaultPolicy != nil {
 				defaultPolicy = *tc.defaultPolicy
@@ -533,11 +561,11 @@ func TestValidateNamespace(t *testing.T) {
 					},
 					{
 						ObjectMeta: metav1.ObjectMeta{Name: "runtimeclass1pod", Annotations: map[string]string{"error": "message"}},
-						Spec:       corev1.PodSpec{RuntimeClassName: pointer.String("runtimeclass1")},
+						Spec:       corev1.PodSpec{RuntimeClassName: ptr.To("runtimeclass1")},
 					},
 					{
 						ObjectMeta: metav1.ObjectMeta{Name: "runtimeclass2pod", Annotations: map[string]string{"error": "message"}},
-						Spec:       corev1.PodSpec{RuntimeClassName: pointer.String("runtimeclass2")},
+						Spec:       corev1.PodSpec{RuntimeClassName: ptr.To("runtimeclass2")},
 					},
 					{
 						ObjectMeta: metav1.ObjectMeta{Name: "runtimeclass3pod", Annotations: map[string]string{"error": "message, message2"}},
@@ -561,7 +589,7 @@ func TestValidateNamespace(t *testing.T) {
 				namespacePodCheckTimeout: time.Second,
 				namespaceMaxPodsToCheck:  4,
 			}
-			result := a.ValidateNamespace(context.TODO(), attrs)
+			result := a.ValidateNamespace(ctx, attrs)
 			if result.Allowed != tc.expectAllowed {
 				t.Errorf("expected allowed=%v, got %v", tc.expectAllowed, result.Allowed)
 			}
@@ -618,11 +646,11 @@ func TestValidatePodAndController(t *testing.T) {
 
 	privilegedPod := *baselinePod.DeepCopy()
 	privilegedPod.Spec.Containers[0].SecurityContext = &corev1.SecurityContext{
-		Privileged: pointer.Bool(true),
+		Privileged: ptr.To(true),
 	}
 
 	exemptRCPod := *privilegedPod.DeepCopy()
-	exemptRCPod.Spec.RuntimeClassName = pointer.String(exemptRuntimeClass)
+	exemptRCPod.Spec.RuntimeClassName = ptr.To(exemptRuntimeClass)
 
 	tolerantPod := *privilegedPod.DeepCopy()
 	tolerantPod.Spec.Tolerations = []corev1.Toleration{{
@@ -674,7 +702,7 @@ func TestValidatePodAndController(t *testing.T) {
 	config.Exemptions.RuntimeClasses = []string{exemptRuntimeClass}
 	config.Exemptions.Usernames = []string{exemptUser}
 
-	evaluator, err := policy.NewEvaluator(policy.DefaultChecks())
+	evaluator, err := policy.NewEvaluator(policy.DefaultChecks(), nil)
 	assert.NoError(t, err)
 
 	type testCase struct {
@@ -934,6 +962,7 @@ func TestValidatePodAndController(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.desc, func(t *testing.T) {
+			_, ctx := ktesting.NewTestContext(t)
 			if tc.obj != nil {
 				tc.obj.(metav1.ObjectMetaAccessor).GetObjectMeta().SetNamespace(tc.namespace)
 			}
@@ -973,7 +1002,7 @@ func TestValidatePodAndController(t *testing.T) {
 			require.NoError(t, a.CompleteConfiguration(), "CompleteConfiguration()")
 			require.NoError(t, a.ValidateConfiguration(), "ValidateConfiguration()")
 
-			response := a.Validate(context.TODO(), attrs)
+			response := a.Validate(ctx, attrs)
 
 			var expectedEvaluations []MetricsRecord
 			var expectedAuditAnnotationKeys []string
@@ -1109,6 +1138,111 @@ func TestPrioritizePods(t *testing.T) {
 	}
 	if len(prioritizedPods) != len(pods) {
 		assert.Fail(t, "Pod count is not the same after prioritization")
+	}
+}
+
+func TestExemptNamespaceWarning(t *testing.T) {
+	privileged := api.LevelVersion{
+		Level:   api.LevelPrivileged,
+		Version: api.LatestVersion(),
+	}
+	privilegedPolicy := api.Policy{
+		Enforce: privileged,
+		Audit:   privileged,
+		Warn:    privileged,
+	}
+	baseline := api.LevelVersion{
+		Level:   api.LevelBaseline,
+		Version: api.MajorMinorVersion(1, 23),
+	}
+	baselinePolicy := api.Policy{
+		Enforce: baseline,
+		Audit:   baseline,
+		Warn:    baseline,
+	}
+	tests := []struct {
+		name                  string
+		labels                map[string]string
+		defaultPolicy         api.Policy // Defaults to privilegedPolicy if empty.
+		expectWarning         bool
+		expectWarningContains string
+	}{{
+		name:          "empty-case",
+		expectWarning: false,
+	}, {
+		name: "ignore-privileged",
+		labels: map[string]string{
+			api.EnforceLevelLabel:   string(api.LevelPrivileged),
+			api.EnforceVersionLabel: "v1.24",
+			api.WarnVersionLabel:    "v1.25",
+		},
+		expectWarning: false,
+	}, {
+		name: "warn-on-enforce",
+		labels: map[string]string{
+			api.EnforceLevelLabel: string(api.LevelBaseline),
+		},
+		expectWarning:         true,
+		expectWarningContains: "(enforce=baseline:latest)",
+	}, {
+		name: "warn-on-warn",
+		labels: map[string]string{
+			api.WarnLevelLabel: string(api.LevelBaseline),
+		},
+		expectWarning:         true,
+		expectWarningContains: "(warn=baseline:latest)",
+	}, {
+		name: "warn-on-audit",
+		labels: map[string]string{
+			api.AuditLevelLabel: string(api.LevelRestricted),
+		},
+		expectWarning:         true,
+		expectWarningContains: "(audit=restricted:latest)",
+	}, {
+		name:          "ignore-default-policy",
+		defaultPolicy: baselinePolicy,
+		expectWarning: false,
+	}, {
+		name: "warn-versions-default-policy",
+		labels: map[string]string{
+			api.WarnVersionLabel: "latest",
+		},
+		defaultPolicy:         baselinePolicy,
+		expectWarning:         true,
+		expectWarningContains: "(warn=baseline:latest)",
+	}}
+
+	const (
+		sentinelLabelKey   = "qqincegidneocgu"
+		sentinelLabelValue = "vpmxkpcjphxrcpx"
+	)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			defaultPolicy := test.defaultPolicy
+			if defaultPolicy == (api.Policy{}) {
+				defaultPolicy = privilegedPolicy
+			}
+			a := &Admission{defaultPolicy: defaultPolicy}
+			labels := test.labels
+			if labels == nil {
+				labels = map[string]string{}
+			}
+			labels[sentinelLabelKey] = sentinelLabelValue
+			policy, err := api.PolicyToEvaluate(labels, defaultPolicy)
+			require.NoError(t, err.ToAggregate())
+
+			warning := a.exemptNamespaceWarning(test.name, policy, labels)
+			if !test.expectWarning {
+				assert.Empty(t, warning)
+				return
+			}
+			require.NotEmpty(t, warning)
+
+			assert.NotContains(t, warning, sentinelLabelKey, "non-podsecurity label key included")
+			assert.NotContains(t, warning, sentinelLabelValue, "non-podsecurity label value included")
+
+			assert.Contains(t, warning, test.expectWarningContains)
+		})
 	}
 }
 

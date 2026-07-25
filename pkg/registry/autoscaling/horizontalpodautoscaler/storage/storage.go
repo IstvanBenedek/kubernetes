@@ -29,7 +29,7 @@ import (
 	printersinternal "k8s.io/kubernetes/pkg/printers/internalversion"
 	printerstorage "k8s.io/kubernetes/pkg/printers/storage"
 	"k8s.io/kubernetes/pkg/registry/autoscaling/horizontalpodautoscaler"
-	"sigs.k8s.io/structured-merge-diff/v4/fieldpath"
+	"sigs.k8s.io/structured-merge-diff/v6/fieldpath"
 )
 
 // REST implements a RESTStorage for pod disruption budgets against etcd
@@ -40,9 +40,10 @@ type REST struct {
 // NewREST returns a RESTStorage object that will work against horizontal pod autoscalers.
 func NewREST(optsGetter generic.RESTOptionsGetter) (*REST, *StatusREST, error) {
 	store := &genericregistry.Store{
-		NewFunc:                  func() runtime.Object { return &autoscaling.HorizontalPodAutoscaler{} },
-		NewListFunc:              func() runtime.Object { return &autoscaling.HorizontalPodAutoscalerList{} },
-		DefaultQualifiedResource: autoscaling.Resource("horizontalpodautoscalers"),
+		NewFunc:                   func() runtime.Object { return &autoscaling.HorizontalPodAutoscaler{} },
+		NewListFunc:               func() runtime.Object { return &autoscaling.HorizontalPodAutoscalerList{} },
+		DefaultQualifiedResource:  autoscaling.Resource("horizontalpodautoscalers"),
+		SingularQualifiedResource: autoscaling.Resource("horizontalpodautoscaler"),
 
 		CreateStrategy:      horizontalpodautoscaler.Strategy,
 		UpdateStrategy:      horizontalpodautoscaler.Strategy,
@@ -88,6 +89,12 @@ func (r *StatusREST) New() runtime.Object {
 	return &autoscaling.HorizontalPodAutoscaler{}
 }
 
+// Destroy cleans up resources on shutdown.
+func (r *StatusREST) Destroy() {
+	// Given that underlying store is shared with REST,
+	// we don't destroy it here explicitly.
+}
+
 // Get retrieves the object from the storage. It is required to support Patch.
 func (r *StatusREST) Get(ctx context.Context, name string, options *metav1.GetOptions) (runtime.Object, error) {
 	return r.store.Get(ctx, name, options)
@@ -103,4 +110,8 @@ func (r *StatusREST) Update(ctx context.Context, name string, objInfo rest.Updat
 // GetResetFields implements rest.ResetFieldsStrategy
 func (r *StatusREST) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
 	return r.store.GetResetFields()
+}
+
+func (r *StatusREST) ConvertToTable(ctx context.Context, object runtime.Object, tableOptions runtime.Object) (*metav1.Table, error) {
+	return r.store.ConvertToTable(ctx, object, tableOptions)
 }

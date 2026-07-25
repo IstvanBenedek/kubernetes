@@ -29,7 +29,7 @@ import (
 	printersinternal "k8s.io/kubernetes/pkg/printers/internalversion"
 	printerstorage "k8s.io/kubernetes/pkg/printers/storage"
 	strategy "k8s.io/kubernetes/pkg/registry/apiserverinternal/storageversion"
-	"sigs.k8s.io/structured-merge-diff/v4/fieldpath"
+	"sigs.k8s.io/structured-merge-diff/v6/fieldpath"
 )
 
 // REST implements a RESTStorage for storage version against etcd
@@ -45,7 +45,8 @@ func NewREST(optsGetter generic.RESTOptionsGetter) (*REST, *StatusREST, error) {
 		ObjectNameFunc: func(obj runtime.Object) (string, error) {
 			return obj.(*apiserverinternal.StorageVersion).Name, nil
 		},
-		DefaultQualifiedResource: apiserverinternal.Resource("storageversions"),
+		DefaultQualifiedResource:  apiserverinternal.Resource("storageversions"),
+		SingularQualifiedResource: apiserverinternal.Resource("storageversion"),
 
 		CreateStrategy:      strategy.Strategy,
 		UpdateStrategy:      strategy.Strategy,
@@ -73,6 +74,12 @@ func (r *StatusREST) New() runtime.Object {
 	return &apiserverinternal.StorageVersion{}
 }
 
+// Destroy cleans up resources on shutdown.
+func (r *StatusREST) Destroy() {
+	// Given that underlying store is shared with REST,
+	// we don't destroy it here explicitly.
+}
+
 // Get retrieves the object from the storage. It is required to support Patch.
 func (r *StatusREST) Get(ctx context.Context, name string, options *metav1.GetOptions) (runtime.Object, error) {
 	return r.store.Get(ctx, name, options)
@@ -88,4 +95,8 @@ func (r *StatusREST) Update(ctx context.Context, name string, objInfo rest.Updat
 // GetResetFields implements rest.ResetFieldsStrategy
 func (r *StatusREST) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
 	return r.store.GetResetFields()
+}
+
+func (r *StatusREST) ConvertToTable(ctx context.Context, object runtime.Object, tableOptions runtime.Object) (*metav1.Table, error) {
+	return r.store.ConvertToTable(ctx, object, tableOptions)
 }

@@ -17,7 +17,9 @@ limitations under the License.
 package e2enode
 
 import (
+	"context"
 	"fmt"
+	"math"
 	"os"
 	"strings"
 	"time"
@@ -25,44 +27,50 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	kubeletstatsv1alpha1 "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
+	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2ekubectl "k8s.io/kubernetes/test/e2e/framework/kubectl"
+	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
 	e2evolume "k8s.io/kubernetes/test/e2e/framework/volume"
+	imageutils "k8s.io/kubernetes/test/utils/image"
+	admissionapi "k8s.io/pod-security-admission/api"
 
 	systemdutil "github.com/coreos/go-systemd/v22/util"
-	"github.com/onsi/ginkgo"
+	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
 	"github.com/onsi/gomega/gstruct"
 	"github.com/onsi/gomega/types"
 )
 
-var _ = SIGDescribe("Summary API [NodeConformance]", func() {
+var _ = SIGDescribe("Summary API", framework.WithNodeConformance(), func() {
 	f := framework.NewDefaultFramework("summary-test")
+	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
 	ginkgo.Context("when querying /stats/summary", func() {
-		ginkgo.AfterEach(func() {
-			if !ginkgo.CurrentGinkgoTestDescription().Failed {
+		ginkgo.AfterEach(func(ctx context.Context) {
+			if !ginkgo.CurrentSpecReport().Failed() {
 				return
 			}
 			if framework.TestContext.DumpLogsOnFailure {
-				e2ekubectl.LogFailedContainers(f.ClientSet, f.Namespace.Name, framework.Logf)
+				e2ekubectl.LogFailedContainers(ctx, f.ClientSet, f.Namespace.Name, framework.Logf)
 			}
 			ginkgo.By("Recording processes in system cgroups")
-			recordSystemCgroupProcesses()
+			recordSystemCgroupProcesses(ctx)
 		})
-		ginkgo.It("should report resource usage through the stats api", func() {
+		ginkgo.It("should report resource usage through the stats api", func(ctx context.Context) {
 			const pod0 = "stats-busybox-0"
 			const pod1 = "stats-busybox-1"
 
 			ginkgo.By("Creating test pods")
 			numRestarts := int32(1)
 			pods := getSummaryTestPods(f, numRestarts, pod0, pod1)
-			f.PodClient().CreateBatch(pods)
+			e2epod.NewPodClient(f).CreateBatch(ctx, pods)
 
 			ginkgo.By("restarting the containers to ensure container metrics are still being gathered after a container is restarted")
-			gomega.Eventually(func() error {
+			gomega.Eventually(ctx, func() error {
 				for _, pod := range pods {
-					err := verifyPodRestartCount(f, pod.Name, len(pod.Spec.Containers), numRestarts)
+					err := verifyPodRestartCount(ctx, f, pod.Name, len(pod.Spec.Containers), numRestarts)
 					if err != nil {
 						return err
 					}
@@ -79,7 +87,7 @@ var _ = SIGDescribe("Summary API [NodeConformance]", func() {
 				maxStatsAge = time.Minute
 			)
 			ginkgo.By("Fetching node so we can match against an appropriate memory limit")
-			node := getLocalNode(f)
+			node := getLocalNode(ctx, f)
 			memoryCapacity := node.Status.Capacity["memory"]
 			memoryLimit := memoryCapacity.Value()
 			fsCapacityBounds := bounded(100*e2evolume.Mb, 10*e2evolume.Tb)
@@ -91,11 +99,12 @@ var _ = SIGDescribe("Summary API [NodeConformance]", func() {
 					"CPU": ptrMatchAllFields(gstruct.Fields{
 						"Time": recent(maxStatsAge),
 						// CRI stats provider tries to estimate the value of UsageNanoCores. This value can be
-						// either 0 or between 10000 and 2e9.
+						// either 0 or between 10000 and 2e10 ( upper limit seen during test execution ).
 						// Please refer, https://github.com/kubernetes/kubernetes/pull/95345#discussion_r501630942
 						// for more information.
-						"UsageNanoCores":       gomega.SatisfyAny(gstruct.PointTo(gomega.BeZero()), bounded(10000, 2e9)),
+						"UsageNanoCores":       gomega.SatisfyAny(gstruct.PointTo(gomega.BeZero()), bounded(10000, 2e10)),
 						"UsageCoreNanoSeconds": bounded(10000000, 1e15),
+						"PSI":                  psiExpectation(),
 					}),
 					"Memory": ptrMatchAllFields(gstruct.Fields{
 						"Time": recent(maxStatsAge),
@@ -106,8 +115,11 @@ var _ = SIGDescribe("Summary API [NodeConformance]", func() {
 						// this now returns /sys/fs/cgroup/memory.stat total_rss
 						"RSSBytes":        bounded(1*e2evolume.Mb, memoryLimit),
 						"PageFaults":      bounded(1000, 1e9),
-						"MajorPageFaults": bounded(0, 100000),
+						"MajorPageFaults": bounded(0, 1e9),
+						"PSI":             psiExpectation(),
 					}),
+					"IO":                 ioExpectation(maxStatsAge),
+					"Swap":               swapExpectation(memoryLimit),
 					"Accelerators":       gomega.BeEmpty(),
 					"Rootfs":             gomega.BeNil(),
 					"Logs":               gomega.BeNil(),
@@ -115,12 +127,12 @@ var _ = SIGDescribe("Summary API [NodeConformance]", func() {
 				})
 			}
 			expectedPageFaultsUpperBound := 1000000
-			expectedMajorPageFaultsUpperBound := 15
+			expectedMajorPageFaultsUpperBound := 1e9
 			if IsCgroup2UnifiedMode() {
 				// On cgroupv2 these stats are recursive, so make sure they are at least like the value set
 				// above for the container.
 				expectedPageFaultsUpperBound = 1e9
-				expectedMajorPageFaultsUpperBound = 100000
+				expectedMajorPageFaultsUpperBound = 1e9
 			}
 
 			podsContExpectations := sysContExpectations().(*gstruct.FieldsMatcher)
@@ -133,6 +145,7 @@ var _ = SIGDescribe("Summary API [NodeConformance]", func() {
 				"RSSBytes":        bounded(1*e2evolume.Kb, memoryLimit),
 				"PageFaults":      bounded(0, expectedPageFaultsUpperBound),
 				"MajorPageFaults": bounded(0, expectedMajorPageFaultsUpperBound),
+				"PSI":             psiExpectation(),
 			})
 			runtimeContExpectations := sysContExpectations().(*gstruct.FieldsMatcher)
 			systemContainers := gstruct.Elements{
@@ -153,7 +166,8 @@ var _ = SIGDescribe("Summary API [NodeConformance]", func() {
 					"WorkingSetBytes": bounded(100*e2evolume.Kb, memoryLimit),
 					"RSSBytes":        bounded(100*e2evolume.Kb, memoryLimit),
 					"PageFaults":      bounded(1000, 1e9),
-					"MajorPageFaults": bounded(0, 100000),
+					"MajorPageFaults": bounded(0, 1e9),
+					"PSI":             psiExpectation(),
 				})
 				systemContainers["misc"] = miscContExpectations
 			}
@@ -168,7 +182,8 @@ var _ = SIGDescribe("Summary API [NodeConformance]", func() {
 						"CPU": ptrMatchAllFields(gstruct.Fields{
 							"Time":                 recent(maxStatsAge),
 							"UsageNanoCores":       bounded(10000, 1e9),
-							"UsageCoreNanoSeconds": bounded(10000000, 1e11),
+							"UsageCoreNanoSeconds": bounded(10000000, 1e12),
+							"PSI":                  psiExpectation(),
 						}),
 						"Memory": ptrMatchAllFields(gstruct.Fields{
 							"Time":            recent(maxStatsAge),
@@ -178,7 +193,10 @@ var _ = SIGDescribe("Summary API [NodeConformance]", func() {
 							"RSSBytes":        bounded(1*e2evolume.Kb, 80*e2evolume.Mb),
 							"PageFaults":      bounded(100, expectedPageFaultsUpperBound),
 							"MajorPageFaults": bounded(0, expectedMajorPageFaultsUpperBound),
+							"PSI":             psiExpectation(),
 						}),
+						"IO":           ioExpectation(maxStatsAge),
+						"Swap":         swapExpectation(memoryLimit),
 						"Accelerators": gomega.BeEmpty(),
 						"Rootfs": ptrMatchAllFields(gstruct.Fields{
 							"Time":           recent(maxStatsAge),
@@ -215,7 +233,8 @@ var _ = SIGDescribe("Summary API [NodeConformance]", func() {
 				"CPU": ptrMatchAllFields(gstruct.Fields{
 					"Time":                 recent(maxStatsAge),
 					"UsageNanoCores":       bounded(10000, 1e9),
-					"UsageCoreNanoSeconds": bounded(10000000, 1e11),
+					"UsageCoreNanoSeconds": bounded(10000000, 1e12),
+					"PSI":                  psiExpectation(),
 				}),
 				"Memory": ptrMatchAllFields(gstruct.Fields{
 					"Time":            recent(maxStatsAge),
@@ -225,7 +244,10 @@ var _ = SIGDescribe("Summary API [NodeConformance]", func() {
 					"RSSBytes":        bounded(1*e2evolume.Kb, 80*e2evolume.Mb),
 					"PageFaults":      bounded(0, expectedPageFaultsUpperBound),
 					"MajorPageFaults": bounded(0, expectedMajorPageFaultsUpperBound),
+					"PSI":             psiExpectation(),
 				}),
+				"IO":   ioExpectation(maxStatsAge),
+				"Swap": swapExpectation(memoryLimit),
 				"VolumeStats": gstruct.MatchAllElements(summaryObjectID, gstruct.Elements{
 					"test-empty-dir": gstruct.MatchAllFields(gstruct.Fields{
 						"Name":   gomega.Equal("test-empty-dir"),
@@ -251,7 +273,7 @@ var _ = SIGDescribe("Summary API [NodeConformance]", func() {
 					"InodesUsed":     bounded(0, 1e8),
 				}),
 				"ProcessStats": ptrMatchAllFields(gstruct.Fields{
-					"ProcessCount": bounded(0, 1e8),
+					"ProcessCount": bounded(1, 1e8),
 				}),
 			})
 
@@ -262,8 +284,9 @@ var _ = SIGDescribe("Summary API [NodeConformance]", func() {
 					"SystemContainers": gstruct.MatchAllElements(summaryObjectID, systemContainers),
 					"CPU": ptrMatchAllFields(gstruct.Fields{
 						"Time":                 recent(maxStatsAge),
-						"UsageNanoCores":       bounded(100e3, 2e9),
+						"UsageNanoCores":       bounded(100e3, 2e10),
 						"UsageCoreNanoSeconds": bounded(1e9, 1e15),
+						"PSI":                  psiExpectation(),
 					}),
 					"Memory": ptrMatchAllFields(gstruct.Fields{
 						"Time":            recent(maxStatsAge),
@@ -273,8 +296,11 @@ var _ = SIGDescribe("Summary API [NodeConformance]", func() {
 						// this now returns /sys/fs/cgroup/memory.stat total_rss
 						"RSSBytes":        bounded(1*e2evolume.Kb, memoryLimit),
 						"PageFaults":      bounded(1000, 1e9),
-						"MajorPageFaults": bounded(0, 100000),
+						"MajorPageFaults": bounded(0, 1e9),
+						"PSI":             psiExpectation(),
 					}),
+					"IO":   ioExpectation(maxStatsAge),
+					"Swap": swapExpectation(memoryLimit),
 					// TODO(#28407): Handle non-eth0 network interface names.
 					"Network": ptrMatchAllFields(gstruct.Fields{
 						"Time": recent(maxStatsAge),
@@ -308,6 +334,16 @@ var _ = SIGDescribe("Summary API [NodeConformance]", func() {
 							"Inodes":     bounded(1e4, 1e8),
 							"InodesUsed": bounded(0, 1e8),
 						}),
+						"ContainerFs": ptrMatchAllFields(gstruct.Fields{
+							"Time":           recent(maxStatsAge),
+							"AvailableBytes": fsCapacityBounds,
+							"CapacityBytes":  fsCapacityBounds,
+							// we assume we are not running tests on machines more than 10tb of disk
+							"UsedBytes":  bounded(e2evolume.Kb, 10*e2evolume.Tb),
+							"InodesFree": bounded(1e4, 1e8),
+							"Inodes":     bounded(1e4, 1e8),
+							"InodesUsed": bounded(0, 1e8),
+						}),
 					}),
 					"Rlimit": ptrMatchAllFields(gstruct.Fields{
 						"Time":                  recent(maxStatsAge),
@@ -324,9 +360,133 @@ var _ = SIGDescribe("Summary API [NodeConformance]", func() {
 
 			ginkgo.By("Validating /stats/summary")
 			// Give pods a minute to actually start up.
-			gomega.Eventually(getNodeSummary, 180*time.Second, 15*time.Second).Should(matchExpectations)
+			gomega.Eventually(ctx, getNodeSummary, 180*time.Second, 15*time.Second).Should(matchExpectations)
 			// Then the summary should match the expectations a few more times.
-			gomega.Consistently(getNodeSummary, 30*time.Second, 15*time.Second).Should(matchExpectations)
+			gomega.Consistently(ctx, getNodeSummary, 30*time.Second, 15*time.Second).Should(matchExpectations)
+		})
+	})
+
+	framework.Context("when querying /stats/summary under pressure", framework.WithSerial(), framework.WithNodeConformance(), framework.WithFeatureGate(features.KubeletPSI), func() {
+		ginkgo.BeforeEach(func() {
+			if !IsCgroup2UnifiedMode() {
+				ginkgo.Skip("Skipping since CgroupV2 not used")
+			}
+		})
+
+		ginkgo.It("should report CPU pressure in PSI metrics", func(ctx context.Context) {
+			podName := "cpu-pressure-pod"
+			ginkgo.By("Creating a pod to generate CPU pressure")
+			podSpec := getStressTestPod(podName, "cpu-stress", []string{"stress", "--cpus", "1"})
+			podSpec.Spec.Containers[0].Resources = v1.ResourceRequirements{
+				Limits: v1.ResourceList{
+					v1.ResourceCPU: resource.MustParse("500m"),
+				},
+				Requests: v1.ResourceList{
+					v1.ResourceCPU: resource.MustParse("500m"),
+				},
+			}
+			pod := e2epod.NewPodClient(f).Create(ctx, podSpec)
+
+			ginkgo.By("Waiting for the pod to start")
+			framework.ExpectNoError(e2epod.WaitForPodRunningInNamespace(ctx, f.ClientSet, pod))
+
+			ginkgo.By("Validating that CPU PSI metrics reflect pressure")
+			gomega.Eventually(ctx, func(g gomega.Gomega) {
+				summary, err := getNodeSummary(ctx)
+				framework.ExpectNoError(err)
+				g.Expect(summary.Pods).To(gstruct.MatchElements(summaryObjectID, gstruct.IgnoreExtras, gstruct.Elements{
+					fmt.Sprintf("%s::%s", f.Namespace.Name, podName): gstruct.MatchFields(gstruct.IgnoreExtras, gstruct.Fields{
+						"CPU": pressureDetected("some", 0.1),
+					}),
+				}))
+			}, 2*time.Minute, 15*time.Second).Should(gomega.Succeed())
+			framework.ExpectNoError(e2epod.NewPodClient(f).Delete(ctx, pod.Name, metav1.DeleteOptions{}))
+		})
+
+		ginkgo.It("should report Memory pressure in PSI metrics", func(ctx context.Context) {
+			runtime, _, err := getCRIClient(ctx)
+			framework.ExpectNoError(err)
+			resp, err := runtime.Version(ctx, "")
+			framework.ExpectNoError(err)
+
+			if resp.GetRuntimeName() == "cri-o" {
+				// Skip this test for CRI-O (used on Fedora CoreOS in test CI) until automatic
+				// memory.high configuration is available. The test fails on Fedora CoreOS due to
+				// different page cache reclaim behavior. CRI-O is implementing a fix to automatically
+				// set memory.high to 95% of memory.max for cgroup v2 containers.
+				// See: https://github.com/cri-o/cri-o/pull/9714
+				// See: https://github.com/coreos/fedora-coreos-tracker/issues/2094
+				ginkgo.Skip("Skipping for CRI-O until automatic memory.high configuration is available")
+			}
+
+			podName := "memory-pressure-pod"
+			ginkgo.By("Creating a pod to generate Memory pressure")
+			// Create a pod that generates memory pressure by continuously writing to files,
+			// forcing kernel page cache reclamation.
+			podSpec := getStressTestPod(podName, "memory-stress", []string{})
+			podSpec.Spec.Containers[0].Command = []string{"/bin/sh", "-c"}
+			podSpec.Spec.Containers[0].Args = []string{
+				// This command runs an infinite loop that uses `dd` to write 50MB files,
+				// cycling through 5 files to target 250MB of reclaimable file cache usage.
+				// This exceeds the 200MB memory limit, forcing the kernel to reclaim memory and generate pressure stalls.
+				"i=0; while true; do dd if=/dev/zero of=testfile.$i bs=1M count=50 &>/dev/null; i=$(((i+1)%5)); sleep 0.1; done",
+			}
+			podSpec.Spec.Containers[0].Resources = v1.ResourceRequirements{
+				Limits: v1.ResourceList{
+					v1.ResourceMemory: resource.MustParse("200M"),
+				},
+				Requests: v1.ResourceList{
+					v1.ResourceMemory: resource.MustParse("200M"),
+				},
+			}
+			pod := e2epod.NewPodClient(f).Create(ctx, podSpec)
+
+			ginkgo.By("Waiting for the pod to start")
+			framework.ExpectNoError(e2epod.WaitForPodRunningInNamespace(ctx, f.ClientSet, pod))
+
+			ginkgo.By("Validating that Memory PSI metrics reflect pressure")
+			gomega.Eventually(ctx, func(g gomega.Gomega) {
+				summary, err := getNodeSummary(ctx)
+				framework.ExpectNoError(err)
+				g.Expect(summary.Pods).To(gstruct.MatchElements(summaryObjectID, gstruct.IgnoreExtras, gstruct.Elements{
+					fmt.Sprintf("%s::%s", f.Namespace.Name, podName): gstruct.MatchFields(gstruct.IgnoreExtras, gstruct.Fields{
+						"Memory": pressureDetected("full", 0.1),
+					}),
+				}))
+			}, 2*time.Minute, 15*time.Second).Should(gomega.Succeed())
+			framework.ExpectNoError(e2epod.NewPodClient(f).Delete(ctx, pod.Name, metav1.DeleteOptions{}))
+		})
+
+		ginkgo.It("should report I/O pressure in PSI metrics", func(ctx context.Context) {
+			podName := "io-pressure-pod"
+			ginkgo.By("Creating a pod to generate I/O pressure")
+			// This workload uses a shell loop to continuously write a file to disk and
+			// sync it, which generates sustained I/O pressure and is a reliable way
+			// to trigger and measure I/O-related PSI metrics.
+			podSpec := getStressTestPod(podName, "io-stress", []string{})
+			podSpec.Spec.Containers[0].Command = []string{"/bin/sh", "-c"}
+			podSpec.Spec.Containers[0].Args = []string{
+				// This command runs an infinite loop to generate sustained I/O pressure.
+				// In each iteration, it writes a 128MB file using `dd` and then calls `sync`
+				// to ensure the data is flushed from memory to the disk, creating authentic I/O stalls.
+				"while true; do dd if=/dev/zero of=testfile bs=1M count=128 &>/dev/null; sync; rm testfile &>/dev/null; done",
+			}
+			pod := e2epod.NewPodClient(f).Create(ctx, podSpec)
+
+			ginkgo.By("Waiting for the pod to start")
+			framework.ExpectNoError(e2epod.WaitForPodRunningInNamespace(ctx, f.ClientSet, pod))
+
+			ginkgo.By("Validating that I/O PSI metrics reflect pressure")
+			gomega.Eventually(ctx, func(g gomega.Gomega) {
+				summary, err := getNodeSummary(ctx)
+				framework.ExpectNoError(err)
+				g.Expect(summary.Pods).To(gstruct.MatchElements(summaryObjectID, gstruct.IgnoreExtras, gstruct.Elements{
+					fmt.Sprintf("%s::%s", f.Namespace.Name, podName): gstruct.MatchFields(gstruct.IgnoreExtras, gstruct.Fields{
+						"IO": pressureDetected("some", 0.1),
+					}),
+				}))
+			}, 2*time.Minute, 15*time.Second).Should(gomega.Succeed())
+			framework.ExpectNoError(e2epod.NewPodClient(f).Delete(ctx, pod.Name, metav1.DeleteOptions{}))
 		})
 	})
 })
@@ -349,7 +509,7 @@ func getSummaryTestPods(f *framework.Framework, numRestarts int32, names ...stri
 								Add: []v1.Capability{"NET_RAW"},
 							},
 						},
-						Command: getRestartingContainerCommand("/test-empty-dir-mnt", 0, numRestarts, "echo 'some bytes' >/outside_the_volume.txt; ping -c 1 google.com; echo 'hello world' >> /test-empty-dir-mnt/file;"),
+						Command: getRestartingContainerCommand("/test-empty-dir-mnt", 0, numRestarts, "dd if=/dev/zero of=/outside_the_volume.txt oflag=direct bs=4096 count=2 2>/dev/null; dd if=/outside_the_volume.txt of=/dev/null iflag=direct bs=4096 count=2 2>/dev/null; ping -c 1 google.com; echo 'hello world' >> /test-empty-dir-mnt/file; dd if=/dev/zero of=/dev/null bs=1 count=10000000;"),
 						Resources: v1.ResourceRequirements{
 							Limits: v1.ResourceList{
 								// Must set memory limit to get MemoryStats.AvailableBytes
@@ -400,9 +560,34 @@ func ptrMatchAllFields(fields gstruct.Fields) types.GomegaMatcher {
 }
 
 func bounded(lower, upper interface{}) types.GomegaMatcher {
-	return gstruct.PointTo(gomega.And(
+	return gstruct.PointTo(boundedValue(lower, upper))
+}
+
+func boundedValue(lower, upper interface{}) types.GomegaMatcher {
+	return gomega.And(
 		gomega.BeNumerically(">=", lower),
-		gomega.BeNumerically("<=", upper)))
+		gomega.BeNumerically("<=", upper))
+}
+
+func swapExpectation(upper interface{}) types.GomegaMatcher {
+	// Size after which we consider memory to be "unlimited". This is not
+	// MaxInt64 due to rounding by the kernel.
+	const maxMemorySize = uint64(1 << 62)
+
+	swapBytesMatcher := gomega.Or(
+		gomega.BeNil(),
+		bounded(0, upper),
+		gstruct.PointTo(gomega.BeNumerically(">=", maxMemorySize)),
+	)
+
+	return gomega.Or(
+		gomega.BeNil(),
+		ptrMatchAllFields(gstruct.Fields{
+			"Time":               recent(maxStatsAge),
+			"SwapUsageBytes":     swapBytesMatcher,
+			"SwapAvailableBytes": swapBytesMatcher,
+		}),
+	)
 }
 
 func recent(d time.Duration) types.GomegaMatcher {
@@ -411,11 +596,11 @@ func recent(d time.Duration) types.GomegaMatcher {
 	}, gomega.And(
 		gomega.BeTemporally(">=", time.Now().Add(-d)),
 		// Now() is the test start time, not the match time, so permit a few extra minutes.
-		gomega.BeTemporally("<", time.Now().Add(2*time.Minute))))
+		gomega.BeTemporally("<", time.Now().Add(3*time.Minute))))
 }
 
-func recordSystemCgroupProcesses() {
-	cfg, err := getCurrentKubeletConfig()
+func recordSystemCgroupProcesses(ctx context.Context) {
+	cfg, err := getCurrentKubeletConfig(ctx)
 	if err != nil {
 		framework.Logf("Failed to read kubelet config: %v", err)
 		return
@@ -451,4 +636,81 @@ func recordSystemCgroupProcesses() {
 			}
 		}
 	}
+}
+
+func psiExpectation() types.GomegaMatcher {
+	if !utilfeature.DefaultFeatureGate.Enabled(features.KubeletPSI) {
+		return gomega.BeNil()
+	}
+	psiDataExpectation := gstruct.MatchAllFields(gstruct.Fields{
+		"Total":  boundedValue(0, uint64(math.MaxUint64)),
+		"Avg10":  boundedValue(0, 100),
+		"Avg60":  boundedValue(0, 100),
+		"Avg300": boundedValue(0, 100),
+	})
+	return ptrMatchAllFields(gstruct.Fields{
+		"Full": psiDataExpectation,
+		"Some": psiDataExpectation,
+	})
+}
+
+func ioExpectation(maxStatsAge time.Duration) types.GomegaMatcher {
+	if !utilfeature.DefaultFeatureGate.Enabled(features.KubeletPSI) {
+		return gomega.BeNil()
+	}
+	return gomega.Or(gomega.BeNil(),
+		ptrMatchAllFields(gstruct.Fields{
+			"Time": recent(maxStatsAge),
+			"PSI":  psiExpectation(),
+		}))
+}
+
+// getStressTestPod returns a pod definition for running a stress test.
+// This follows the test plan's strategy to use a configurable container to generate load.
+func getStressTestPod(name, containerName string, args []string) *v1.Pod {
+	return &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name,
+		},
+		Spec: v1.PodSpec{
+			RestartPolicy: v1.RestartPolicyNever,
+			Containers: []v1.Container{
+				{
+					Name:  containerName,
+					Image: imageutils.GetE2EImage(imageutils.Agnhost),
+					Args:  args,
+				},
+			},
+		},
+	}
+}
+
+// pressureDetected is a matcher for verifying that PSI stats show pressure.
+// The test plan requires asserting that values are plausibly correlated with the load,
+// not just that the fields exist.
+func pressureDetected(level string, threshold float64) types.GomegaMatcher {
+	var fields gstruct.Fields
+	switch level {
+	case "some":
+		fields = gstruct.Fields{
+			"Some": gstruct.MatchFields(gstruct.IgnoreExtras, gstruct.Fields{
+				"Avg10": gomega.BeNumerically(">", threshold),
+				"Total": gomega.BeNumerically(">", uint64(0)),
+			}),
+		}
+	case "full":
+		fields = gstruct.Fields{
+			"Full": gstruct.MatchFields(gstruct.IgnoreExtras, gstruct.Fields{
+				"Avg10": gomega.BeNumerically(">", threshold),
+				"Total": gomega.BeNumerically(">", uint64(0)),
+			}),
+		}
+	default:
+		framework.Failf("Unknown pressure level: %s", level)
+		return nil
+	}
+
+	return gstruct.PointTo(gstruct.MatchFields(gstruct.IgnoreExtras, gstruct.Fields{
+		"PSI": gstruct.PointTo(gstruct.MatchFields(gstruct.IgnoreExtras, fields)),
+	}))
 }

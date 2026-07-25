@@ -43,7 +43,6 @@ contexts:
   name: test
 current-context: test
 kind: Config
-preferences: {}
 users:
 - name: invalid_token_user
   user:
@@ -82,7 +81,7 @@ EOF
   fi
   # Post-condition: None
 
-  cat > "${TMPDIR:-/tmp}"/valid_exec_plugin.yaml << EOF
+  cat >"${TMPDIR:-/tmp}"/valid_exec_plugin.yaml <<EOF
 apiVersion: v1
 clusters:
 - cluster:
@@ -94,7 +93,6 @@ contexts:
   name: test
 current-context: test
 kind: Config
-preferences: {}
 users:
 - name: valid_token_user
   user:
@@ -134,11 +132,167 @@ EOF
   fi
   # Post-condition: None
 
+  ### Provided --client-certificate/--client-key should take precedence on the cli, thus not triggering the (invalid) exec credential plugin
+  # contained in the kubeconfig.
+
+  # Use CSR to get a valid certificate
+  cat <<EOF | kubectl create -f -
+apiVersion: certificates.k8s.io/v1
+kind: CertificateSigningRequest
+metadata:
+  name: testuser
+spec:
+  request: $(base64 < hack/testdata/auth/testuser.csr | tr -d '\n')
+  signerName: kubernetes.io/kube-apiserver-client
+  usages: [client auth]
+EOF
+
+  kube::test::wait_object_assert 'csr/testuser' '{{range.status.conditions}}{{.type}}{{end}}' ''
+  kubectl certificate approve testuser
+  kube::test::wait_object_assert 'csr/testuser' '{{range.status.conditions}}{{.type}}{{end}}' 'Approved'
+  # wait for certificate to not be empty
+  kube::test::wait_object_assert 'csr/testuser' '{{.status.certificate}}' '.+'
+  kubectl get csr testuser -o jsonpath='{.status.certificate}' | base64 -d > "${TMPDIR:-/tmp}"/testuser.crt
+
+  output5=$(kubectl  "${kube_flags_without_token[@]:?}" --client-certificate="${TMPDIR:-/tmp}"/testuser.crt --client-key="hack/testdata/auth/testuser.key" --kubeconfig="${TMPDIR:-/tmp}"/invalid_exec_plugin.yaml get namespace kube-system -o name)
+  if [[ "${output5}" =~ "Unauthorized" ]]; then
+    kube::log::status "Unexpected output when providing --client-certificate/--client-key for authentication - exec credential plugin likely triggered. Output: ${output5}"
+    exit 1
+  else
+    kube::log::status "exec credential plugin not triggered since kubectl was called with provided --client-certificate/--client-key"
+  fi
+
+    ### Provided --client-certificate/--client-key should take precedence in the kubeconfig, thus not triggering the (invalid) exec credential plugin.
+  cat >"${TMPDIR:-/tmp}"/invalid_execcredential.sh <<EOF
+#!/bin/bash
+echo '{"kind":"ExecCredential","apiVersion":"client.authentication.k8s.io/v1beta1","status":{"clientKeyData":"bad","clientCertificateData":"bad"}}'
+EOF
+  chmod +x "${TMPDIR:-/tmp}"/invalid_execcredential.sh
+
+  kubectl config set-credentials testuser --client-certificate="${TMPDIR:-/tmp}"/testuser.crt --client-key="hack/testdata/auth/testuser.key" --exec-api-version=client.authentication.k8s.io/v1beta1 --exec-command=/tmp/invalid_execcredential.sh
+  output6=$(kubectl  "${kube_flags_without_token[@]:?}" --user testuser get namespace kube-system -o name)
+  if [[ "${output6}" =~ "Unauthorized" ]]; then
+    kube::log::status "Unexpected output when kubeconfig was configured with --client-certificate/--client-key for authentication - exec credential plugin likely triggered. Output: ${output6}"
+    exit 1
+  else
+    kube::log::status "exec credential plugin not triggered since kubeconfig was configured with --client-certificate/--client-key for authentication"
+  fi
+
+  run_allowlist_tests_version
+
+  kubectl delete csr testuser
+  rm "${TMPDIR:-/tmp}"/invalid_execcredential.sh
   rm "${TMPDIR:-/tmp}"/invalid_exec_plugin.yaml
   rm "${TMPDIR:-/tmp}"/valid_exec_plugin.yaml
 
   set +o nounset
   set +o errexit
+}
+
+run_allowlist_tests_version() {
+  set +o nounset
+  set +o errexit
+
+  cat >"${TMPDIR:-/tmp}/kuberc-deny-all.yaml" <<EOF
+apiVersion: kubectl.config.k8s.io/v1beta1
+kind: Preference
+credentialPluginPolicy: DenyAll
+EOF
+
+  output7=$(kubectl --kubeconfig="${TMPDIR:-/tmp}/valid_exec_plugin.yaml" --kuberc="${TMPDIR:-/tmp}/kuberc-deny-all.yaml" "${kube_flags_without_token[@]:?}" get namespace kube-system -o name 2>&1)
+  rc7="$?"
+
+  if [ "$rc7" -ne 0 ] && [[ "$output7" =~ "DenyAll" ]]; then
+    kube::log::status "exec credential plugin not triggered because plugin policy set to DenyAll"
+  else
+    kube::log::status "Unexpected output when kuberc was configured with credentialPluginPolicy: DenyAll. Exec credential plugin ran despite DenyAll policy"
+    exit 1
+  fi
+
+  output8=$(kubectl --kubeconfig="${TMPDIR:-/tmp}/valid_exec_plugin.yaml" --kuberc="${TMPDIR:-/tmp}/kuberc-deny-all.yaml" "${kube_flags_without_token[@]:?}" config view)
+  rc8="$?"
+
+  if [ "$rc8" -eq 0 ] && kube::test::if_has_string "$output8" "kind: Config"; then
+    kube::log::status "plugin policy has no effect on 'kubectl config view'"
+  else
+    kube::log::status "plugin policy 'DenyAll' prevented 'kubectl config view' from running"
+    exit 1
+  fi
+
+  cat >"${TMPDIR:-/tmp}/kuberc-allowlist-should-fail.yaml" <<EOF
+apiVersion: kubectl.config.k8s.io/v1beta1
+kind: Preference
+credentialPluginPolicy: Allowlist
+credentialPluginAllowlist:
+  - name: abc123
+  - name: foobar
+EOF
+
+  output9=$(kubectl --kubeconfig="${TMPDIR:-/tmp}/valid_exec_plugin.yaml" --kuberc="${TMPDIR:-/tmp}/kuberc-allowlist-should-fail.yaml" "${kube_flags_without_token[@]:?}" get namespace kube-system -o name 2>&1)
+  rc9="$?"
+
+  if [ "$rc9" -ne 0 ] && kube::test::if_has_string "$output9" "is not permitted by the credential plugin allowlist"; then
+    kube::log::status "exec credential plugin not triggered because allowlist does not permit it"
+  else
+    kube::log::status "Unexpected output when kuberc was configured with credentialPluginPolicy: Allowlist. Exec credential plugin ran despite not appearing in allowlist"
+    exit 1
+  fi
+
+  cat >"${TMPDIR:-/tmp}/kuberc-allowlist-should-succeed.yaml" <<EOF
+apiVersion: kubectl.config.k8s.io/v1beta1
+kind: Preference
+credentialPluginPolicy: Allowlist
+credentialPluginAllowlist:
+  - name: foobar
+  - name: echo
+EOF
+
+  output10=$(kubectl --kubeconfig="${TMPDIR:-/tmp}/valid_exec_plugin.yaml" --kuberc="${TMPDIR:-/tmp}/kuberc-allowlist-should-succeed.yaml" "${kube_flags_without_token[@]:?}" get namespace kube-system -o name)
+  rc10="$?"
+
+  if [ "$rc10" -eq 0 ] && [[ "$output10" =~ "namespace/kube-system" ]]; then
+    kube::log::status "exec credential plugin permitted by allowlist"
+  else
+    kube::log::status "Unexpected output when kuberc was configured with credentialPluginPolicy: Allowlist. Exec credential plugin not triggered despite appearing in allowlist"
+    exit 1
+  fi
+
+  cat >"${TMPDIR:-/tmp}/kuberc-allowlist-not-given.yaml" <<EOF
+apiVersion: kubectl.config.k8s.io/v1beta1
+kind: Preference
+EOF
+
+  output11=$(kubectl --kubeconfig="${TMPDIR:-/tmp}/valid_exec_plugin.yaml" --kuberc="${TMPDIR:-/tmp}/kuberc-allowlist-not-given.yaml" "${kube_flags_without_token[@]:?}" get namespace kube-system -o name)
+  rc11="$?"
+
+  if [ "$rc11" -eq 0 ] && [[ "$output11" =~ "namespace/kube-system" ]]; then
+    kube::log::status "exec credential plugin permitted by missing allowlist"
+  else
+    kube::log::status "Unexpected output when kuberc was configured without allowlist"
+    exit 1
+  fi
+
+  cat >"${TMPDIR:-/tmp}/kuberc-invalid-allowlist.yaml" <<EOF
+apiVersion: kubectl.config.k8s.io/v1beta1
+kind: Preference
+credentialPluginPolicy: AllowAll
+credentialPluginAllowlist:
+  - name: foobar
+  - name: echo
+EOF
+
+  output12=$(kubectl --kubeconfig="${TMPDIR:-/tmp}/valid_exec_plugin.yaml" --kuberc="${TMPDIR:-/tmp}/kuberc-invalid-allowlist.yaml" "${kube_flags_without_token[@]:?}" get namespace kube-system -o name 2>&1)
+  rc12="$?"
+
+  if [ "$rc12" -ne 0 ] && [[ "$output12" =~ "misconfigured credential plugin allowlist" ]]; then
+    kube::log::status "exec credential plugin denied by invalid allowlist"
+  else
+    kube::log::status "Unexpected output when kuberc was configured with invalid allowlist"
+    exit 1
+  fi
+
+  set -o nounset
+  set -o errexit
 }
 
 run_exec_credentials_interactive_tests() {
@@ -154,7 +308,7 @@ run_exec_credentials_interactive_tests_version() {
 
   kube::log::status "Testing kubectl with configured ${apiVersion} interactive exec credentials plugin"
 
-  cat > "${TMPDIR:-/tmp}"/always_interactive_exec_plugin.yaml << EOF
+  cat >"${TMPDIR:-/tmp}"/always_interactive_exec_plugin.yaml <<EOF
 apiVersion: v1
 clusters:
 - cluster:
@@ -166,7 +320,6 @@ contexts:
   name: test
 current-context: test
 kind: Config
-preferences: {}
 users:
 - name: always_interactive_token_user
   user:
@@ -227,7 +380,7 @@ EOF
   fi
   # Post-condition: None
 
-  cat > "${TMPDIR:-/tmp}"/missing_interactive_exec_plugin.yaml << EOF
+  cat >"${TMPDIR:-/tmp}"/missing_interactive_exec_plugin.yaml <<EOF
 apiVersion: v1
 clusters:
 - cluster:
@@ -239,7 +392,6 @@ contexts:
   name: test
 current-context: test
 kind: Config
-preferences: {}
 users:
 - name: missing_interactive_token_user
   user:

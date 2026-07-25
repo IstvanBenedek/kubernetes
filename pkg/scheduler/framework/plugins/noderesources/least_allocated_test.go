@@ -21,37 +21,30 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/validation/field"
+	"k8s.io/klog/v2/ktesting"
+	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/apis/config"
+	"k8s.io/kubernetes/pkg/scheduler/backend/cache"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	plfeature "k8s.io/kubernetes/pkg/scheduler/framework/plugins/feature"
 	"k8s.io/kubernetes/pkg/scheduler/framework/runtime"
-	"k8s.io/kubernetes/pkg/scheduler/internal/cache"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
+	tf "k8s.io/kubernetes/pkg/scheduler/testing/framework"
 )
 
 func TestLeastAllocatedScoringStrategy(t *testing.T) {
-	defaultResources := []config.ResourceSpec{
-		{Name: string(v1.ResourceCPU), Weight: 1},
-		{Name: string(v1.ResourceMemory), Weight: 1},
-	}
-
-	extendedRes := "abc.com/xyz"
-	extendedResourceLeastAllocatedSet := []config.ResourceSpec{
-		{Name: string(v1.ResourceCPU), Weight: 1},
-		{Name: string(v1.ResourceMemory), Weight: 1},
-		{Name: extendedRes, Weight: 1},
-	}
-
 	tests := []struct {
 		name           string
 		requestedPod   *v1.Pod
 		nodes          []*v1.Node
 		existingPods   []*v1.Pod
-		expectedScores framework.NodeScoreList
+		expectedScores fwk.NodeScoreList
 		resources      []config.ResourceSpec
 		wantErrs       field.ErrorList
+		wantStatusCode fwk.Code
 	}{
 		{
 			// Node1 scores (remaining resources) on 0-MaxNodeScore scale
@@ -69,7 +62,7 @@ func TestLeastAllocatedScoringStrategy(t *testing.T) {
 				st.MakeNode().Name("node2").Capacity(map[v1.ResourceName]string{"cpu": "4000", "memory": "10000"}).Obj(),
 			},
 			existingPods:   nil,
-			expectedScores: []framework.NodeScore{{Name: "node1", Score: framework.MaxNodeScore}, {Name: "node2", Score: framework.MaxNodeScore}},
+			expectedScores: []fwk.NodeScore{{Name: "node1", Score: fwk.MaxNodeScore}, {Name: "node2", Score: fwk.MaxNodeScore}},
 			resources:      defaultResources,
 		},
 		{
@@ -81,7 +74,7 @@ func TestLeastAllocatedScoringStrategy(t *testing.T) {
 			// CPU Score: ((6000 - 3000) * MaxNodeScore) / 6000 = 50
 			// Memory Score: ((10000 - 5000) * MaxNodeScore) / 10000 = 50
 			// Node2 Score: (50 + 50) / 2 = 50
-			name: "nothing scheduled, resources requested, differently sized machines",
+			name: "nothing scheduled, resources requested, differently sized nodes",
 			requestedPod: st.MakePod().
 				Req(map[v1.ResourceName]string{"cpu": "1000", "memory": "2000"}).
 				Req(map[v1.ResourceName]string{"cpu": "2000", "memory": "3000"}).
@@ -91,11 +84,11 @@ func TestLeastAllocatedScoringStrategy(t *testing.T) {
 				st.MakeNode().Name("node2").Capacity(map[v1.ResourceName]string{"cpu": "6000", "memory": "10000"}).Obj(),
 			},
 			existingPods:   nil,
-			expectedScores: []framework.NodeScore{{Name: "node1", Score: 37}, {Name: "node2", Score: 50}},
+			expectedScores: []fwk.NodeScore{{Name: "node1", Score: 37}, {Name: "node2", Score: 50}},
 			resources:      defaultResources,
 		},
 		{
-			name: "Resources not set, nothing scheduled, resources requested, differently sized machines",
+			name: "Resources not set, pods scheduled with error",
 			requestedPod: st.MakePod().
 				Req(map[v1.ResourceName]string{"cpu": "1000", "memory": "2000"}).
 				Req(map[v1.ResourceName]string{"cpu": "2000", "memory": "3000"}).
@@ -105,8 +98,9 @@ func TestLeastAllocatedScoringStrategy(t *testing.T) {
 				st.MakeNode().Name("node2").Capacity(map[v1.ResourceName]string{"cpu": "6000", "memory": "10000"}).Obj(),
 			},
 			existingPods:   nil,
-			expectedScores: []framework.NodeScore{{Name: "node1", Score: framework.MinNodeScore}, {Name: "node2", Score: framework.MinNodeScore}},
+			expectedScores: []fwk.NodeScore{{Name: "node1", Score: fwk.MinNodeScore}, {Name: "node2", Score: fwk.MinNodeScore}},
 			resources:      nil,
+			wantStatusCode: fwk.Error,
 		},
 		{
 			// Node1 scores on 0-MaxNodeScore scale
@@ -129,7 +123,7 @@ func TestLeastAllocatedScoringStrategy(t *testing.T) {
 				st.MakePod().Node("node2").Obj(),
 				st.MakePod().Node("node2").Obj(),
 			},
-			expectedScores: []framework.NodeScore{{Name: "node1", Score: framework.MaxNodeScore}, {Name: "node2", Score: framework.MaxNodeScore}},
+			expectedScores: []fwk.NodeScore{{Name: "node1", Score: fwk.MaxNodeScore}, {Name: "node2", Score: fwk.MaxNodeScore}},
 			resources:      defaultResources,
 		},
 		{
@@ -153,7 +147,7 @@ func TestLeastAllocatedScoringStrategy(t *testing.T) {
 				st.MakePod().Node("node2").Req(map[v1.ResourceName]string{"cpu": "3000", "memory": "0"}).Obj(),
 				st.MakePod().Node("node2").Req(map[v1.ResourceName]string{"cpu": "3000", "memory": "5000"}).Obj(),
 			},
-			expectedScores: []framework.NodeScore{{Name: "node1", Score: 70}, {Name: "node2", Score: 57}},
+			expectedScores: []fwk.NodeScore{{Name: "node1", Score: 70}, {Name: "node2", Score: 57}},
 			resources:      defaultResources,
 		},
 		{
@@ -178,7 +172,7 @@ func TestLeastAllocatedScoringStrategy(t *testing.T) {
 				st.MakePod().Node("node1").Req(map[v1.ResourceName]string{"cpu": "3000", "memory": "0"}).Obj(),
 				st.MakePod().Node("node2").Req(map[v1.ResourceName]string{"cpu": "3000", "memory": "5000"}).Obj(),
 			},
-			expectedScores: []framework.NodeScore{{Name: "node1", Score: 57}, {Name: "node2", Score: 45}},
+			expectedScores: []fwk.NodeScore{{Name: "node1", Score: 57}, {Name: "node2", Score: 45}},
 			resources:      defaultResources,
 		},
 		{
@@ -190,7 +184,7 @@ func TestLeastAllocatedScoringStrategy(t *testing.T) {
 			// CPU Score: ((10000 - 6000) * MaxNodeScore) / 10000 = 40
 			// Memory Score: ((50000 - 10000) * MaxNodeScore) / 50000 = 80
 			// Node2 Score: (40 + 80) / 2 = 60
-			name: "resources requested, pods scheduled with resources, differently sized machines",
+			name: "resources requested, pods scheduled with resources, differently sized nodes",
 			requestedPod: st.MakePod().
 				Req(map[v1.ResourceName]string{"cpu": "1000", "memory": "2000"}).
 				Req(map[v1.ResourceName]string{"cpu": "2000", "memory": "3000"}).
@@ -203,7 +197,7 @@ func TestLeastAllocatedScoringStrategy(t *testing.T) {
 				st.MakePod().Node("node1").Req(map[v1.ResourceName]string{"cpu": "3000", "memory": "0"}).Obj(),
 				st.MakePod().Node("node2").Req(map[v1.ResourceName]string{"cpu": "3000", "memory": "5000"}).Obj(),
 			},
-			expectedScores: []framework.NodeScore{{Name: "node1", Score: 57}, {Name: "node2", Score: 60}},
+			expectedScores: []fwk.NodeScore{{Name: "node1", Score: 57}, {Name: "node2", Score: 60}},
 			resources:      defaultResources,
 		},
 		{
@@ -225,7 +219,7 @@ func TestLeastAllocatedScoringStrategy(t *testing.T) {
 				st.MakePod().Node("node1").Req(map[v1.ResourceName]string{"cpu": "3000", "memory": "0"}).Obj(),
 				st.MakePod().Node("node2").Req(map[v1.ResourceName]string{"cpu": "3000", "memory": "5000"}).Obj(),
 			},
-			expectedScores: []framework.NodeScore{{Name: "node1", Score: 50}, {Name: "node2", Score: 25}},
+			expectedScores: []fwk.NodeScore{{Name: "node1", Score: 50}, {Name: "node2", Score: 25}},
 			resources:      defaultResources,
 		},
 		{
@@ -239,7 +233,7 @@ func TestLeastAllocatedScoringStrategy(t *testing.T) {
 				st.MakePod().Node("node1").Req(map[v1.ResourceName]string{"cpu": "3000", "memory": "0"}).Obj(),
 				st.MakePod().Node("node2").Req(map[v1.ResourceName]string{"cpu": "3000", "memory": "5000"}).Obj(),
 			},
-			expectedScores: []framework.NodeScore{{Name: "node1", Score: framework.MinNodeScore}, {Name: "node2", Score: framework.MinNodeScore}},
+			expectedScores: []fwk.NodeScore{{Name: "node1", Score: fwk.MinNodeScore}, {Name: "node2", Score: fwk.MinNodeScore}},
 			resources:      defaultResources,
 		},
 		{
@@ -249,7 +243,7 @@ func TestLeastAllocatedScoringStrategy(t *testing.T) {
 			// CPU Score: ((6000 - 3000) *100) / 6000 = 50
 			// Memory Score: ((10000 - 5000) *100) / 10000 = 50
 			// Node2 Score: (50 * 1 + 50 * 2) / (1 + 2) = 50
-			name: "nothing scheduled, resources requested with different weight on CPU and memory, differently sized machines",
+			name: "nothing scheduled, resources requested with different weight on CPU and memory, differently sized nodes",
 			requestedPod: st.MakePod().Node("node1").
 				Req(map[v1.ResourceName]string{"cpu": "1000", "memory": "2000"}).
 				Req(map[v1.ResourceName]string{"cpu": "2000", "memory": "3000"}).
@@ -259,7 +253,7 @@ func TestLeastAllocatedScoringStrategy(t *testing.T) {
 				st.MakeNode().Name("node2").Capacity(map[v1.ResourceName]string{"cpu": "6000", "memory": "10000"}).Obj(),
 			},
 			existingPods:   nil,
-			expectedScores: []framework.NodeScore{{Name: "node1", Score: 41}, {Name: "node2", Score: 50}},
+			expectedScores: []fwk.NodeScore{{Name: "node1", Score: 41}, {Name: "node2", Score: 50}},
 			resources: []config.ResourceSpec{
 				{Name: "memory", Weight: 2},
 				{Name: "cpu", Weight: 1},
@@ -282,7 +276,7 @@ func TestLeastAllocatedScoringStrategy(t *testing.T) {
 			wantErrs: field.ErrorList{
 				&field.Error{
 					Type:  field.ErrorTypeInvalid,
-					Field: "resources[0].weight",
+					Field: "scoringStrategy.resources[0].weight",
 				},
 			},
 		},
@@ -297,7 +291,7 @@ func TestLeastAllocatedScoringStrategy(t *testing.T) {
 				st.MakeNode().Name("node1").Capacity(map[v1.ResourceName]string{"cpu": "4000", "memory": "10000"}).Obj(),
 			},
 			existingPods:   nil,
-			expectedScores: []framework.NodeScore{{Name: "node1", Score: 41}, {Name: "node2", Score: 50}},
+			expectedScores: []fwk.NodeScore{{Name: "node1", Score: 41}, {Name: "node2", Score: 50}},
 			resources: []config.ResourceSpec{
 				{Name: "memory", Weight: 1},
 				{Name: "cpu", Weight: 0},
@@ -305,7 +299,7 @@ func TestLeastAllocatedScoringStrategy(t *testing.T) {
 			wantErrs: field.ErrorList{
 				&field.Error{
 					Type:  field.ErrorTypeInvalid,
-					Field: "resources[1].weight",
+					Field: "scoringStrategy.resources[1].weight",
 				},
 			},
 		},
@@ -326,7 +320,7 @@ func TestLeastAllocatedScoringStrategy(t *testing.T) {
 			wantErrs: field.ErrorList{
 				&field.Error{
 					Type:  field.ErrorTypeInvalid,
-					Field: "resources[1].weight",
+					Field: "scoringStrategy.resources[1].weight",
 				},
 			},
 		},
@@ -346,8 +340,8 @@ func TestLeastAllocatedScoringStrategy(t *testing.T) {
 				st.MakeNode().Name("node1").Capacity(map[v1.ResourceName]string{"cpu": "6000", "memory": "10000"}).Obj(),
 				st.MakeNode().Name("node2").Capacity(map[v1.ResourceName]string{"cpu": "6000", "memory": "10000", v1.ResourceName(extendedRes): "4"}).Obj(),
 			},
-			expectedScores: []framework.NodeScore{{Name: "node1", Score: 50}, {Name: "node2", Score: 50}},
-			resources:      extendedResourceLeastAllocatedSet,
+			expectedScores: []fwk.NodeScore{{Name: "node1", Score: 50}, {Name: "node2", Score: 50}},
+			resources:      extendedResourceSet,
 		},
 		{
 			// Honor extended resource if the pod requests.
@@ -367,24 +361,50 @@ func TestLeastAllocatedScoringStrategy(t *testing.T) {
 				st.MakeNode().Name("node2").Capacity(map[v1.ResourceName]string{"cpu": "6000", "memory": "10000", v1.ResourceName(extendedRes): "10"}).Obj(),
 			},
 			existingPods:   nil,
-			expectedScores: []framework.NodeScore{{Name: "node1", Score: 50}, {Name: "node2", Score: 60}},
-			resources:      extendedResourceLeastAllocatedSet,
+			expectedScores: []fwk.NodeScore{{Name: "node1", Score: 50}, {Name: "node2", Score: 60}},
+			resources:      extendedResourceSet,
+		},
+		{
+			// If the node doesn't have a resource
+			// CPU Score: ((6000 - 3000) * 100) / 6000 = 50
+			// Memory Score: ((10000 - 4000) * 100) / 10000 = 60
+			// Node1 Score: (50 * 1 + 60 * 1) / (1 + 1) = 55
+			// Node2 Score: (50 * 1 + 60 * 1) / (1 + 1) = 55
+			name: "if the node doesn't have a resource",
+			requestedPod: st.MakePod().Node("node1").
+				Req(map[v1.ResourceName]string{"cpu": "3000", "memory": "4000"}).
+				Obj(),
+			nodes: []*v1.Node{
+				st.MakeNode().Name("node1").Capacity(map[v1.ResourceName]string{"cpu": "6000", "memory": "10000"}).Obj(),
+				st.MakeNode().Name("node2").Capacity(map[v1.ResourceName]string{"cpu": "6000", "memory": "10000", v1.ResourceName(extendedRes): "4"}).Obj(),
+			},
+			expectedScores: []fwk.NodeScore{{Name: "node1", Score: 55}, {Name: "node2", Score: 55}},
+			resources: []config.ResourceSpec{
+				{Name: extendedRes, Weight: 2},
+				{Name: string(v1.ResourceCPU), Weight: 1},
+				{Name: string(v1.ResourceMemory), Weight: 1},
+			},
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			_, ctx := ktesting.NewTestContext(t)
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+
 			state := framework.NewCycleState()
 			snapshot := cache.NewSnapshot(test.existingPods, test.nodes)
-			fh, _ := runtime.NewFramework(nil, nil, runtime.WithSnapshotSharedLister(snapshot))
+			fh, _ := runtime.NewFramework(ctx, nil, nil, runtime.WithSnapshotSharedLister(snapshot))
 
 			p, err := NewFit(
+				ctx,
 				&config.NodeResourcesFitArgs{
 					ScoringStrategy: &config.ScoringStrategy{
 						Type:      config.LeastAllocated,
 						Resources: test.resources,
 					},
-				}, fh, plfeature.Features{EnablePodOverhead: true})
+				}, fh, plfeature.Features{})
 
 			if diff := cmp.Diff(test.wantErrs.ToAggregate(), err, ignoreBadValueDetail); diff != "" {
 				t.Fatalf("got err (-want,+got):\n%s", diff)
@@ -393,13 +413,22 @@ func TestLeastAllocatedScoringStrategy(t *testing.T) {
 				return
 			}
 
-			var gotScores framework.NodeScoreList
+			status := p.(fwk.PreScorePlugin).PreScore(ctx, state, test.requestedPod, tf.BuildNodeInfos(test.nodes))
+			if !status.IsSuccess() {
+				t.Errorf("PreScore is expected to return success, but didn't. Got status: %v", status)
+			}
+
+			var gotScores fwk.NodeScoreList
 			for _, n := range test.nodes {
-				score, status := p.(framework.ScorePlugin).Score(context.Background(), state, test.requestedPod, n.Name)
-				if !status.IsSuccess() {
-					t.Errorf("unexpected error: %v", status)
+				nodeInfo, err := snapshot.Get(n.Name)
+				if err != nil {
+					t.Errorf("failed to get node %q from snapshot: %v", n.Name, err)
 				}
-				gotScores = append(gotScores, framework.NodeScore{Name: n.Name, Score: score})
+				score, status := p.(fwk.ScorePlugin).Score(ctx, state, test.requestedPod, nodeInfo)
+				if status.Code() != test.wantStatusCode {
+					t.Errorf("unexpected status code, want: %v, got: %v", test.wantStatusCode, status.Code())
+				}
+				gotScores = append(gotScores, fwk.NodeScore{Name: n.Name, Score: score})
 			}
 
 			if diff := cmp.Diff(test.expectedScores, gotScores); diff != "" {

@@ -27,12 +27,13 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apiserver/pkg/endpoints/handlers/fieldmanager"
+	"k8s.io/apimachinery/pkg/util/managedfields"
 	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/registry/generic"
 	genericregistry "k8s.io/apiserver/pkg/registry/generic/registry"
 	"k8s.io/apiserver/pkg/registry/rest"
 	"k8s.io/klog/v2"
+	"k8s.io/kubernetes/pkg/api/legacyscheme"
 	"k8s.io/kubernetes/pkg/apis/autoscaling"
 	autoscalingv1 "k8s.io/kubernetes/pkg/apis/autoscaling/v1"
 	"k8s.io/kubernetes/pkg/apis/autoscaling/validation"
@@ -42,7 +43,7 @@ import (
 	printersinternal "k8s.io/kubernetes/pkg/printers/internalversion"
 	printerstorage "k8s.io/kubernetes/pkg/printers/storage"
 	"k8s.io/kubernetes/pkg/registry/core/replicationcontroller"
-	"sigs.k8s.io/structured-merge-diff/v4/fieldpath"
+	"sigs.k8s.io/structured-merge-diff/v6/fieldpath"
 )
 
 // ControllerStorage includes dummy storage for Replication Controllers and for Scale subresource.
@@ -53,12 +54,12 @@ type ControllerStorage struct {
 }
 
 // ReplicasPathMappings returns the mappings between each group version and a replicas path
-func ReplicasPathMappings() fieldmanager.ResourcePathMappings {
+func ReplicasPathMappings() managedfields.ResourcePathMappings {
 	return replicasPathInReplicationController
 }
 
 // maps a group version to the replicas path in a deployment object
-var replicasPathInReplicationController = fieldmanager.ResourcePathMappings{
+var replicasPathInReplicationController = managedfields.ResourcePathMappings{
 	schema.GroupVersion{Group: "", Version: "v1"}.String(): fieldpath.MakePathOrDie("spec", "replicas"),
 }
 
@@ -82,10 +83,11 @@ type REST struct {
 // NewREST returns a RESTStorage object that will work against replication controllers.
 func NewREST(optsGetter generic.RESTOptionsGetter) (*REST, *StatusREST, error) {
 	store := &genericregistry.Store{
-		NewFunc:                  func() runtime.Object { return &api.ReplicationController{} },
-		NewListFunc:              func() runtime.Object { return &api.ReplicationControllerList{} },
-		PredicateFunc:            replicationcontroller.MatchController,
-		DefaultQualifiedResource: api.Resource("replicationcontrollers"),
+		NewFunc:                   func() runtime.Object { return &api.ReplicationController{} },
+		NewListFunc:               func() runtime.Object { return &api.ReplicationControllerList{} },
+		PredicateFunc:             replicationcontroller.MatchController,
+		DefaultQualifiedResource:  api.Resource("replicationcontrollers"),
+		SingularQualifiedResource: api.Resource("replicationcontroller"),
 
 		CreateStrategy:      replicationcontroller.Strategy,
 		UpdateStrategy:      replicationcontroller.Strategy,
@@ -131,6 +133,12 @@ func (r *StatusREST) New() runtime.Object {
 	return &api.ReplicationController{}
 }
 
+// Destroy cleans up resources on shutdown.
+func (r *StatusREST) Destroy() {
+	// Given that underlying store is shared with REST,
+	// we don't destroy it here explicitly.
+}
+
 // Get retrieves the object from the storage. It is required to support Patch.
 func (r *StatusREST) Get(ctx context.Context, name string, options *metav1.GetOptions) (runtime.Object, error) {
 	return r.store.Get(ctx, name, options)
@@ -146,6 +154,10 @@ func (r *StatusREST) Update(ctx context.Context, name string, objInfo rest.Updat
 // GetResetFields implements rest.ResetFieldsStrategy
 func (r *StatusREST) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
 	return r.store.GetResetFields()
+}
+
+func (r *StatusREST) ConvertToTable(ctx context.Context, object runtime.Object, tableOptions runtime.Object) (*metav1.Table, error) {
+	return r.store.ConvertToTable(ctx, object, tableOptions)
 }
 
 type ScaleREST struct {
@@ -170,10 +182,16 @@ func (r *ScaleREST) New() runtime.Object {
 	return &autoscaling.Scale{}
 }
 
+// Destroy cleans up resources on shutdown.
+func (r *ScaleREST) Destroy() {
+	// Given that underlying store is shared with REST,
+	// we don't destroy it here explicitly.
+}
+
 func (r *ScaleREST) Get(ctx context.Context, name string, options *metav1.GetOptions) (runtime.Object, error) {
 	obj, err := r.store.Get(ctx, name, options)
 	if err != nil {
-		return nil, errors.NewNotFound(autoscaling.Resource("replicationcontrollers/scale"), name)
+		return nil, err
 	}
 	rc := obj.(*api.ReplicationController)
 	return scaleFromRC(rc), nil
@@ -183,7 +201,7 @@ func (r *ScaleREST) Update(ctx context.Context, name string, objInfo rest.Update
 	obj, _, err := r.store.Update(
 		ctx,
 		name,
-		&scaleUpdatedObjectInfo{name, objInfo},
+		&scaleUpdatedObjectInfo{name, objInfo, r},
 		toScaleCreateValidation(createValidation),
 		toScaleUpdateValidation(updateValidation),
 		false,
@@ -194,6 +212,10 @@ func (r *ScaleREST) Update(ctx context.Context, name string, objInfo rest.Update
 	}
 	rc := obj.(*api.ReplicationController)
 	return scaleFromRC(rc), false, nil
+}
+
+func (r *ScaleREST) ConvertToTable(ctx context.Context, object runtime.Object, tableOptions runtime.Object) (*metav1.Table, error) {
+	return r.store.ConvertToTable(ctx, object, tableOptions)
 }
 
 func toScaleCreateValidation(f rest.ValidateObjectFunc) rest.ValidateObjectFunc {
@@ -223,7 +245,7 @@ func scaleFromRC(rc *api.ReplicationController) *autoscaling.Scale {
 			CreationTimestamp: rc.CreationTimestamp,
 		},
 		Spec: autoscaling.ScaleSpec{
-			Replicas: rc.Spec.Replicas,
+			Replicas: *rc.Spec.Replicas,
 		},
 		Status: autoscaling.ScaleStatus{
 			Replicas: rc.Status.Replicas,
@@ -234,8 +256,9 @@ func scaleFromRC(rc *api.ReplicationController) *autoscaling.Scale {
 
 // scaleUpdatedObjectInfo transforms existing replication controller -> existing scale -> new scale -> new replication controller
 type scaleUpdatedObjectInfo struct {
-	name       string
-	reqObjInfo rest.UpdatedObjectInfo
+	name           string
+	reqObjInfo     rest.UpdatedObjectInfo
+	scaleGVKMapper rest.GroupVersionKindProvider
 }
 
 func (i *scaleUpdatedObjectInfo) Preconditions() *metav1.Preconditions {
@@ -258,11 +281,11 @@ func (i *scaleUpdatedObjectInfo) UpdatedObject(ctx context.Context, oldObj runti
 		if _, ok := replicasPathInReplicationController[requestGroupVersion.String()]; ok {
 			groupVersion = requestGroupVersion
 		} else {
-			klog.Fatal("Unrecognized group/version in request info %q", requestGroupVersion.String())
+			klog.Fatalf("Unrecognized group/version in request info %q", requestGroupVersion.String())
 		}
 	}
 
-	managedFieldsHandler := fieldmanager.NewScaleHandler(
+	managedFieldsHandler := managedfields.NewScaleHandler(
 		replicationcontroller.ManagedFields,
 		groupVersion,
 		replicasPathInReplicationController,
@@ -289,8 +312,9 @@ func (i *scaleUpdatedObjectInfo) UpdatedObject(ctx context.Context, oldObj runti
 		return nil, errors.NewBadRequest(fmt.Sprintf("expected input object type to be Scale, but %T", newScaleObj))
 	}
 
-	// validate
-	if errs := validation.ValidateScale(scale); len(errs) > 0 {
+	errs := validation.ValidateScaleUpdate(ctx, scale, oldScale, legacyscheme.Scheme, i.scaleGVKMapper)
+
+	if len(errs) > 0 {
 		return nil, errors.NewInvalid(autoscaling.Kind("Scale"), replicationcontroller.Name, errs)
 	}
 
@@ -304,7 +328,7 @@ func (i *scaleUpdatedObjectInfo) UpdatedObject(ctx context.Context, oldObj runti
 	}
 
 	// move replicas/resourceVersion fields to object and return
-	replicationcontroller.Spec.Replicas = scale.Spec.Replicas
+	replicationcontroller.Spec.Replicas = &scale.Spec.Replicas
 	replicationcontroller.ResourceVersion = scale.ResourceVersion
 
 	updatedEntries, err := managedFieldsHandler.ToParent(scale.ManagedFields)

@@ -18,24 +18,19 @@ package stats
 
 import (
 	"errors"
-	"fmt"
 	"testing"
 	"time"
 
-	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
 
-	csipbv1 "github.com/container-storage-interface/spec/lib/go/csi"
 	k8sv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/tools/record"
-	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	kubestats "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
-	"k8s.io/kubernetes/pkg/features"
 	statstest "k8s.io/kubernetes/pkg/kubelet/server/stats/testing"
 	"k8s.io/kubernetes/pkg/volume"
+	"k8s.io/kubernetes/test/utils/ktesting"
 )
 
 const (
@@ -100,16 +95,17 @@ var (
 			Volumes: podVolumes,
 		},
 	}
-
-	volumeCondition = &csipbv1.VolumeCondition{}
 )
 
 func TestPVCRef(t *testing.T) {
-	mockCtrl := gomock.NewController(t)
-	defer mockCtrl.Finish()
+	ktesting.Init(t).SyncTest("", testPVCRef)
+}
 
+func testPVCRef(tCtx ktesting.TContext) {
+	t := tCtx.TB()
+	logger := tCtx.Logger()
 	// Setup mock stats provider
-	mockStats := statstest.NewMockProvider(mockCtrl)
+	mockStats := statstest.NewMockProvider(t)
 	volumes := map[string]volume.Volume{vol0: &fakeVolume{}, vol1: &fakeVolume{}, vol3: &fakeVolume{}}
 	mockStats.EXPECT().ListVolumesForPod(fakePod.UID).Return(volumes, true)
 	blockVolumes := map[string]volume.BlockVolume{vol2: &fakeBlockVolume{}}
@@ -122,7 +118,7 @@ func TestPVCRef(t *testing.T) {
 
 	// Calculate stats for pod
 	statsCalculator := newVolumeStatCalculator(mockStats, time.Minute, fakePod, &fakeEventRecorder)
-	statsCalculator.calcAndStoreStats()
+	statsCalculator.calcAndStoreStats(logger)
 	vs, _ := statsCalculator.GetLatest()
 
 	assert.Len(t, append(vs.EphemeralVolumes, vs.PersistentVolumes...), 4)
@@ -140,7 +136,7 @@ func TestPVCRef(t *testing.T) {
 		},
 		FsStats: expectedFSStats(),
 	})
-	// Verify 'vol2' has a PVC reference
+	// // Verify 'vol2' has a PVC reference
 	assert.Contains(t, append(vs.EphemeralVolumes, vs.PersistentVolumes...), kubestats.VolumeStats{
 		Name: vol2,
 		PVCRef: &kubestats.PVCReference{
@@ -161,9 +157,13 @@ func TestPVCRef(t *testing.T) {
 }
 
 func TestNormalVolumeEvent(t *testing.T) {
-	mockCtrl := gomock.NewController(t)
-	defer mockCtrl.Finish()
-	mockStats := statstest.NewMockProvider(mockCtrl)
+	ktesting.Init(t).SyncTest("", testNormalVolumeEvent)
+}
+
+func testNormalVolumeEvent(tCtx ktesting.TContext) {
+	t := tCtx.TB()
+	logger := tCtx.Logger()
+	mockStats := statstest.NewMockProvider(t)
 
 	volumes := map[string]volume.Volume{vol0: &fakeVolume{}, vol1: &fakeVolume{}}
 	mockStats.EXPECT().ListVolumesForPod(fakePod.UID).Return(volumes, true)
@@ -177,39 +177,11 @@ func TestNormalVolumeEvent(t *testing.T) {
 
 	// Calculate stats for pod
 	statsCalculator := newVolumeStatCalculator(mockStats, time.Minute, fakePod, &fakeEventRecorder)
-	statsCalculator.calcAndStoreStats()
+	statsCalculator.calcAndStoreStats(logger)
 
 	event, err := WatchEvent(eventStore)
-	assert.NotNil(t, err)
+	assert.Error(t, err)
 	assert.Equal(t, "", event)
-}
-
-func TestAbnormalVolumeEvent(t *testing.T) {
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.CSIVolumeHealth, true)()
-	mockCtrl := gomock.NewController(t)
-	defer mockCtrl.Finish()
-
-	// Setup mock stats provider
-	mockStats := statstest.NewMockProvider(mockCtrl)
-	volumes := map[string]volume.Volume{vol0: &fakeVolume{}}
-	mockStats.EXPECT().ListVolumesForPod(fakePod.UID).Return(volumes, true)
-	blockVolumes := map[string]volume.BlockVolume{vol1: &fakeBlockVolume{}}
-	mockStats.EXPECT().ListBlockVolumesForPod(fakePod.UID).Return(blockVolumes, true)
-
-	eventStore := make(chan string, 2)
-	fakeEventRecorder := record.FakeRecorder{
-		Events: eventStore,
-	}
-
-	// Calculate stats for pod
-	volumeCondition.Message = "The target path of the volume doesn't exist"
-	volumeCondition.Abnormal = true
-	statsCalculator := newVolumeStatCalculator(mockStats, time.Minute, fakePod, &fakeEventRecorder)
-	statsCalculator.calcAndStoreStats()
-
-	event, err := WatchEvent(eventStore)
-	assert.Nil(t, err)
-	assert.Equal(t, fmt.Sprintf("Warning VolumeConditionAbnormal Volume %s: The target path of the volume doesn't exist", "vol0"), event)
 }
 
 func WatchEvent(eventChan <-chan string) (string, error) {
@@ -233,16 +205,16 @@ func (v *fakeVolume) GetMetrics() (*volume.Metrics, error) {
 }
 
 func expectedMetrics() *volume.Metrics {
-	return &volume.Metrics{
+	vMetrics := &volume.Metrics{
 		Available:  resource.NewQuantity(available, resource.BinarySI),
 		Capacity:   resource.NewQuantity(capacity, resource.BinarySI),
 		Used:       resource.NewQuantity(available-capacity, resource.BinarySI),
 		Inodes:     resource.NewQuantity(inodesTotal, resource.BinarySI),
 		InodesFree: resource.NewQuantity(inodesFree, resource.BinarySI),
 		InodesUsed: resource.NewQuantity(inodesTotal-inodesFree, resource.BinarySI),
-		Message:    &volumeCondition.Message,
-		Abnormal:   &volumeCondition.Abnormal,
 	}
+
+	return vMetrics
 }
 
 func expectedFSStats() kubestats.FsStats {
@@ -279,11 +251,13 @@ func (v *fakeBlockVolume) GetMetrics() (*volume.Metrics, error) {
 }
 
 func expectedBlockMetrics() *volume.Metrics {
-	return &volume.Metrics{
+	vMetrics := &volume.Metrics{
 		Available: resource.NewQuantity(available, resource.BinarySI),
 		Capacity:  resource.NewQuantity(capacity, resource.BinarySI),
 		Used:      resource.NewQuantity(available-capacity, resource.BinarySI),
 	}
+
+	return vMetrics
 }
 
 func expectedBlockStats() kubestats.FsStats {

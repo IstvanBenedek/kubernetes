@@ -17,25 +17,21 @@ limitations under the License.
 package resourcequota
 
 import (
+	"context"
+	"reflect"
 	"testing"
-
-	"github.com/google/go-cmp/cmp"
 
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
-	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	api "k8s.io/kubernetes/pkg/apis/core"
-	"k8s.io/kubernetes/pkg/apis/core/validation"
-	"k8s.io/kubernetes/pkg/features"
 )
 
 func TestResourceQuotaStrategy(t *testing.T) {
 	if !Strategy.NamespaceScoped() {
 		t.Errorf("ResourceQuota should be namespace scoped")
 	}
-	if Strategy.AllowCreateOnUpdate() {
+	if Strategy.AllowCreateOnUpdate(context.Background()) {
 		t.Errorf("ResourceQuota should not allow create on update")
 	}
 	resourceQuota := &api.ResourceQuota{
@@ -65,63 +61,82 @@ func TestResourceQuotaStrategy(t *testing.T) {
 	}
 }
 
-func TestGetValidationOptionsFromResourceQuota(t *testing.T) {
-	crossNamespaceAffinity := api.ResourceQuota{Spec: api.ResourceQuotaSpec{
-		Scopes: []api.ResourceQuotaScope{api.ResourceQuotaScopeCrossNamespacePodAffinity},
-	},
+func Test_WarningsOnCreate(t *testing.T) {
+	tests := []struct {
+		name         string
+		args         *api.ResourceQuota
+		wantWarnings []string
+	}{
+		{
+			name:         "Empty Hard Spec",
+			args:         &api.ResourceQuota{},
+			wantWarnings: []string{},
+		},
+		{
+			name: "Request less than limit",
+			args: &api.ResourceQuota{
+				Spec: api.ResourceQuotaSpec{
+					Hard: api.ResourceList{
+						api.ResourceName("requests.cpu"):               resource.MustParse("500m"),
+						api.ResourceName("limits.cpu"):                 resource.MustParse("1"),
+						api.ResourceName("requests.memory"):            resource.MustParse("1Gi"),
+						api.ResourceName("limits.memory"):              resource.MustParse("2Gi"),
+						api.ResourceName("requests.storage"):           resource.MustParse("1Gi"),
+						api.ResourceName("limits.storage"):             resource.MustParse("2Gi"),
+						api.ResourceName("requests.ephemeral-storage"): resource.MustParse("1Gi"),
+						api.ResourceName("limits.ephemeral-storage"):   resource.MustParse("2Gi"),
+					},
+				},
+			},
+			wantWarnings: []string{},
+		},
+		{
+			name: "Request greater than limit",
+			args: &api.ResourceQuota{
+				Spec: api.ResourceQuotaSpec{
+					Hard: api.ResourceList{
+						api.ResourceName("requests.cpu"):               resource.MustParse("2"),
+						api.ResourceName("limits.cpu"):                 resource.MustParse("1"),
+						api.ResourceName("requests.memory"):            resource.MustParse("3Gi"),
+						api.ResourceName("limits.memory"):              resource.MustParse("2Gi"),
+						api.ResourceName("requests.storage"):           resource.MustParse("3Gi"),
+						api.ResourceName("limits.storage"):             resource.MustParse("2Gi"),
+						api.ResourceName("requests.ephemeral-storage"): resource.MustParse("3Gi"),
+						api.ResourceName("limits.ephemeral-storage"):   resource.MustParse("2Gi"),
+					},
+				},
+			},
+			wantWarnings: []string{
+				"ResourceQuota requests.cpu (2) should be less than limits.cpu (1)",
+				"ResourceQuota requests.memory (3Gi) should be less than limits.memory (2Gi)",
+				"ResourceQuota requests.storage (3Gi) should be less than limits.storage (2Gi)",
+				"ResourceQuota requests.ephemeral-storage (3Gi) should be less than limits.ephemeral-storage (2Gi)",
+			},
+		},
+		{
+			name: "Request greater than limit, bare names",
+			args: &api.ResourceQuota{
+				Spec: api.ResourceQuotaSpec{
+					Hard: api.ResourceList{
+						api.ResourceName("cpu"):           resource.MustParse("2"),
+						api.ResourceName("limits.cpu"):    resource.MustParse("1"),
+						api.ResourceName("memory"):        resource.MustParse("3Gi"),
+						api.ResourceName("limits.memory"): resource.MustParse("2Gi"),
+					},
+				},
+			},
+			wantWarnings: []string{
+				"ResourceQuota cpu (2) should be less than limits.cpu (1)",
+				"ResourceQuota memory (3Gi) should be less than limits.memory (2Gi)",
+			},
+		},
 	}
 
-	for name, tc := range map[string]struct {
-		old                             *api.ResourceQuota
-		namespaceSelectorFeatureEnabled bool
-		wantOpts                        validation.ResourceQuotaValidationOptions
-	}{
-		"create-feature-enabled": {
-			namespaceSelectorFeatureEnabled: true,
-			wantOpts: validation.ResourceQuotaValidationOptions{
-				AllowPodAffinityNamespaceSelector: true,
-			},
-		},
-		"create-feature-disabled": {
-			namespaceSelectorFeatureEnabled: false,
-			wantOpts: validation.ResourceQuotaValidationOptions{
-				AllowPodAffinityNamespaceSelector: false,
-			},
-		},
-		"update-old-doesn't-include-scope-feature-enabled": {
-			old:                             &api.ResourceQuota{},
-			namespaceSelectorFeatureEnabled: true,
-			wantOpts: validation.ResourceQuotaValidationOptions{
-				AllowPodAffinityNamespaceSelector: true,
-			},
-		},
-		"update-old-doesn't-include-scope-feature-disabled": {
-			old:                             &api.ResourceQuota{},
-			namespaceSelectorFeatureEnabled: false,
-			wantOpts: validation.ResourceQuotaValidationOptions{
-				AllowPodAffinityNamespaceSelector: false,
-			},
-		},
-		"update-old-includes-scope-feature-disabled": {
-			old:                             &crossNamespaceAffinity,
-			namespaceSelectorFeatureEnabled: false,
-			wantOpts: validation.ResourceQuotaValidationOptions{
-				AllowPodAffinityNamespaceSelector: true,
-			},
-		},
-		"update-old-includes-scope-feature-enabled": {
-			old:                             &crossNamespaceAffinity,
-			namespaceSelectorFeatureEnabled: true,
-			wantOpts: validation.ResourceQuotaValidationOptions{
-				AllowPodAffinityNamespaceSelector: true,
-			},
-		},
-	} {
-		t.Run(name, func(t *testing.T) {
-			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.PodAffinityNamespaceSelector, tc.namespaceSelectorFeatureEnabled)()
-			gotOpts := getValidationOptionsFromResourceQuota(nil, tc.old)
-			if diff := cmp.Diff(tc.wantOpts, gotOpts); diff != "" {
-				t.Errorf("unexpected opts (-want, +got):\n%s", diff)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			warnings := Strategy.WarningsOnCreate(context.Background(), tt.args)
+			if len(warnings)+len(tt.wantWarnings) > 0 && !reflect.DeepEqual(warnings, tt.wantWarnings) {
+				t.Errorf("WarningsOnCreate()\n   got: %q\n  want: %q", warnings, tt.wantWarnings)
 			}
 		})
 	}

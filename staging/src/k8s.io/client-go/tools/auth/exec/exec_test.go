@@ -25,7 +25,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	clientauthenticationv1 "k8s.io/client-go/pkg/apis/clientauthentication/v1"
-	clientauthenticationv1alpha1 "k8s.io/client-go/pkg/apis/clientauthentication/v1alpha1"
 	clientauthenticationv1beta1 "k8s.io/client-go/pkg/apis/clientauthentication/v1beta1"
 	"k8s.io/client-go/rest"
 )
@@ -244,11 +243,6 @@ func TestLoadExecCredential(t *testing.T) {
 			wantErrorPrefix: "ExecCredential does not contain cluster information",
 		},
 		{
-			name:            "v1alpha1",
-			data:            marshal(t, clientauthenticationv1alpha1.SchemeGroupVersion, &clientauthenticationv1alpha1.ExecCredential{}),
-			wantErrorPrefix: "ExecCredential does not contain cluster information",
-		},
-		{
 			name:            "invalid object kind",
 			data:            marshal(t, metav1.SchemeGroupVersion, &metav1.Status{}),
 			wantErrorPrefix: "invalid group/kind: wanted ExecCredential.client.authentication.k8s.io, got Status",
@@ -260,7 +254,6 @@ func TestLoadExecCredential(t *testing.T) {
 		},
 	}
 	for _, test := range tests {
-		test := test
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 

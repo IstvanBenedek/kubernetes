@@ -25,25 +25,29 @@ import (
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	utilvalidation "k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/registry/rest"
 	"k8s.io/apiserver/pkg/storage/names"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/kubernetes/pkg/api/job"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
 	"k8s.io/kubernetes/pkg/api/pod"
 	"k8s.io/kubernetes/pkg/apis/batch"
-	"k8s.io/kubernetes/pkg/apis/batch/validation"
-	"sigs.k8s.io/structured-merge-diff/v4/fieldpath"
+	batchvalidation "k8s.io/kubernetes/pkg/apis/batch/validation"
+	"k8s.io/kubernetes/pkg/features"
+	"sigs.k8s.io/structured-merge-diff/v6/fieldpath"
 )
 
 // cronJobStrategy implements verification logic for Replication Controllers.
 type cronJobStrategy struct {
-	runtime.ObjectTyper
+	rest.DeclarativeValidation
 	names.NameGenerator
 }
 
 // Strategy is the default logic that applies when creating and updating CronJob objects.
-var Strategy = cronJobStrategy{legacyscheme.Scheme, names.SimpleNameGenerator}
+var Strategy = cronJobStrategy{rest.DeclarativeValidation{Scheme: legacyscheme.Scheme}, names.SimpleNameGenerator}
 
 // DefaultGarbageCollectionPolicy returns OrphanDependents for batch/v1beta1 for backwards compatibility,
 // and DeleteDependents for all other versions.
@@ -88,6 +92,8 @@ func (cronJobStrategy) PrepareForCreate(ctx context.Context, obj runtime.Object)
 
 	cronJob.Generation = 1
 
+	job.DropDisabledFields(&cronJob.Spec.JobTemplate.Spec, nil)
+
 	pod.DropDisabledTemplateFields(&cronJob.Spec.JobTemplate.Spec.Template, nil)
 }
 
@@ -96,6 +102,8 @@ func (cronJobStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Ob
 	newCronJob := obj.(*batch.CronJob)
 	oldCronJob := old.(*batch.CronJob)
 	newCronJob.Status = oldCronJob.Status
+
+	job.DropDisabledFields(&newCronJob.Spec.JobTemplate.Spec, &oldCronJob.Spec.JobTemplate.Spec)
 
 	pod.DropDisabledTemplateFields(&newCronJob.Spec.JobTemplate.Spec.Template, &oldCronJob.Spec.JobTemplate.Spec.Template)
 
@@ -110,16 +118,25 @@ func (cronJobStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Ob
 func (cronJobStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
 	cronJob := obj.(*batch.CronJob)
 	opts := pod.GetValidationOptionsFromPodTemplate(&cronJob.Spec.JobTemplate.Spec.Template, nil)
-	return validation.ValidateCronJob(cronJob, opts)
+	return batchvalidation.ValidateCronJobCreate(cronJob, opts)
+}
+
+// DeclarativeValidationConfig declares the options referenced by this type's tags,
+// mapped to whether each is enabled.
+func (cronJobStrategy) DeclarativeValidationConfig(ctx context.Context, obj, oldObj runtime.Object) rest.DeclarativeValidationConfig {
+	return rest.DeclarativeValidationConfig{Options: map[string]bool{
+		string(features.WorkloadWithJob): utilfeature.DefaultFeatureGate.Enabled(features.WorkloadWithJob),
+	}}
 }
 
 // WarningsOnCreate returns warnings for the creation of the given object.
 func (cronJobStrategy) WarningsOnCreate(ctx context.Context, obj runtime.Object) []string {
 	newCronJob := obj.(*batch.CronJob)
-	warnings := pod.GetWarningsForPodTemplate(ctx, field.NewPath("spec", "jobTemplate", "spec", "template"), &newCronJob.Spec.JobTemplate.Spec.Template, nil)
-	if strings.Contains(newCronJob.Spec.Schedule, "TZ") {
-		warnings = append(warnings, fmt.Sprintf("CRON_TZ or TZ used in %s is not officially supported, see https://kubernetes.io/docs/concepts/workloads/controllers/cron-jobs/ for more details", field.NewPath("spec", "spec", "schedule")))
+	var warnings []string
+	if msgs := utilvalidation.IsDNS1123Label(newCronJob.Name); len(msgs) != 0 {
+		warnings = append(warnings, fmt.Sprintf("metadata.name: this is used in Pod names and hostnames, which can result in surprising behavior; a DNS label is recommended: %v", msgs))
 	}
+	warnings = append(warnings, job.WarningsForJobSpec(ctx, field.NewPath("spec", "jobTemplate", "spec"), &newCronJob.Spec.JobTemplate.Spec, nil)...)
 	return warnings
 }
 
@@ -127,12 +144,12 @@ func (cronJobStrategy) WarningsOnCreate(ctx context.Context, obj runtime.Object)
 func (cronJobStrategy) Canonicalize(obj runtime.Object) {
 }
 
-func (cronJobStrategy) AllowUnconditionalUpdate() bool {
+func (cronJobStrategy) AllowUnconditionalUpdate(ctx context.Context) bool {
 	return true
 }
 
 // AllowCreateOnUpdate is false for scheduled jobs; this means a POST is needed to create one.
-func (cronJobStrategy) AllowCreateOnUpdate() bool {
+func (cronJobStrategy) AllowCreateOnUpdate(ctx context.Context) bool {
 	return false
 }
 
@@ -142,7 +159,7 @@ func (cronJobStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Obje
 	oldCronJob := old.(*batch.CronJob)
 
 	opts := pod.GetValidationOptionsFromPodTemplate(&newCronJob.Spec.JobTemplate.Spec.Template, &oldCronJob.Spec.JobTemplate.Spec.Template)
-	return validation.ValidateCronJobUpdate(newCronJob, oldCronJob, opts)
+	return batchvalidation.ValidateCronJobUpdate(newCronJob, oldCronJob, opts)
 }
 
 // WarningsOnUpdate returns warnings for the given update.
@@ -151,10 +168,10 @@ func (cronJobStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Ob
 	newCronJob := obj.(*batch.CronJob)
 	oldCronJob := old.(*batch.CronJob)
 	if newCronJob.Generation != oldCronJob.Generation {
-		warnings = pod.GetWarningsForPodTemplate(ctx, field.NewPath("spec", "jobTemplate", "spec", "template"), &newCronJob.Spec.JobTemplate.Spec.Template, &oldCronJob.Spec.JobTemplate.Spec.Template)
+		warnings = job.WarningsForJobSpec(ctx, field.NewPath("spec", "jobTemplate", "spec"), &newCronJob.Spec.JobTemplate.Spec, &oldCronJob.Spec.JobTemplate.Spec)
 	}
 	if strings.Contains(newCronJob.Spec.Schedule, "TZ") {
-		warnings = append(warnings, fmt.Sprintf("CRON_TZ or TZ used in %s is not officially supported, see https://kubernetes.io/docs/concepts/workloads/controllers/cron-jobs/ for more details", field.NewPath("spec", "spec", "schedule")))
+		warnings = append(warnings, fmt.Sprintf("cannot use TZ or CRON_TZ in %s, use timeZone instead, see https://kubernetes.io/docs/concepts/workloads/controllers/cron-jobs/ for more details", field.NewPath("spec", "spec", "schedule")))
 	}
 	return warnings
 }
